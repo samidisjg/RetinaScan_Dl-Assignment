@@ -1,0 +1,50 @@
+# ======================
+#  PYTHON / DEEP LEARNING
+# ======================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment folders
+.venv/
+venv/
+env/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# ======================
+#  IDE / EDITOR FILES
+# ======================
+
+# PyCharm / IntelliJ
+.idea/
+*.iml
+
+# VSCode (if ever opened there)
+.vscode/
+
+# ======================
+#  DATA / MODEL OUTPUTS
+# ======================
+
+# Your dataset (large files)
+data/
+
+# Model weights, checkpoints, runs
+runs/
+checkpoints/
+logs/
+
+# Generated reports, plots, etc.
+report/
+output/
+figs/
+
+# ======================
+#  OS / MISC
+# ======================
+.DS_Store
+Thumbs.db
