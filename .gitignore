@@ -1,9 +1,13 @@
-# IDE
+# ======================
+#  IDE / EDITOR FILES
+# ======================
 .idea/
 *.iml
 .vscode/
 
-# Python
+# ======================
+#  PYTHON / CACHE / ENVS
+# ======================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -11,16 +15,24 @@ __pycache__/
 venv/
 env/
 
-# Data / outputs
-data/**
-!data/*.csv
-runs/
-checkpoints/
-logs/
-report/
-output/
-figs/
+# ======================
+#  DATA / OUTPUTS (for all submodules)
+# ======================
 
-# OS
+# Ignore data folders everywhere, but keep CSVs
+**/data/**
+!**/data/*.csv
+
+# Ignore model outputs / checkpoints / logs in any subdir
+**/runs/
+**/checkpoints/
+**/logs/
+**/report/
+**/output/
+**/figs/
+
+# ======================
+#  OS / MISC
+# ======================
 .DS_Store
 Thumbs.db
