@@ -18,9 +18,14 @@ def get_device():
     return torch.device("cpu")
 
 def save_json(obj, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Convert NumPy types (like np.int64) to native Python types
+    def default(o):
+        if hasattr(o, "item"):  # NumPy scalar
+            return o.item()
+        raise TypeError(f"Type {type(o)} not serializable")
+
     with open(path, "w") as f:
-        json.dump(obj, f, indent=2)
+        json.dump(obj, f, indent=2, default=default)
 
 def load_json(path):
     with open(path, "r") as f:

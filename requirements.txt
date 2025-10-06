@@ -1,3 +1,4 @@
+numpy
 torch>=2.3
 torchvision>=0.18
 timm>=1.0.7

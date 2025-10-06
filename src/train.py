@@ -72,7 +72,8 @@ def main(args):
     model = build_densenet121(num_classes, pretrained=True).to(device)
 
     os.makedirs(args.out_dir, exist_ok=True)
-    save_json({c:i for i,c in enumerate(classes)}, os.path.join(args.out_dir, "class_to_idx.json"))
+    class_to_idx = {str(c): int(i) for i, c in enumerate(classes)}  # cast keys to str (or int(c))
+    save_json(class_to_idx, os.path.join(args.out_dir, "class_to_idx.json"))
 
     criterion = nn.CrossEntropyLoss()
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

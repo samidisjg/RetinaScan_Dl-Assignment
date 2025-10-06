@@ -1,4 +1,5 @@
 import cv2, pandas as pd, torch
+import numpy as np
 from torch.utils.data import Dataset
 
 class RetinaDataset(Dataset):
@@ -13,10 +14,11 @@ class RetinaDataset(Dataset):
     def __getitem__(self, i):
         row = self.df.iloc[i]
         img = cv2.imread(row.filepath)
-        if img is None:
-            raise RuntimeError(f'Failed to read image: {row.filepath}')
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         if self.tfm:
-            img = self.tfm(image=img)['image']
+            img = self.tfm(image=img)["image"]
+        # Convert to tensor if not already
+        if isinstance(img, np.ndarray):
+            img = torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
         y = self.class_to_idx[row.label]
         return img, torch.tensor(y).long()
