@@ -1,47 +1,26 @@
-# ======================
-#  PYTHON / DEEP LEARNING
-# ======================
+# IDE
+.idea/
+*.iml
+.vscode/
 
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Virtual environment folders
 .venv/
 venv/
 env/
 
-# ======================
-#  IDE / EDITOR FILES
-# ======================
-
-# PyCharm / IntelliJ
-.idea/
-*.iml
-
-# VSCode (if ever opened there)
-.vscode/
-
-# ======================
-#  DATA / MODEL OUTPUTS
-# ======================
-
-# Ignore everything in data except the CSV splits
+# Data / outputs
 data/**
 !data/*.csv
-
-# Model weights, checkpoints, runs
 runs/
 checkpoints/
 logs/
-
-# Generated reports, plots, etc.
 report/
 output/
 figs/
 
-# ======================
-#  OS / MISC
-# ======================
+# OS
 .DS_Store
 Thumbs.db
