@@ -2,7 +2,6 @@
 #  PYTHON / DEEP LEARNING
 # ======================
 
-# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -11,9 +10,6 @@ __pycache__/
 .venv/
 venv/
 env/
-
-# Jupyter checkpoints
-.ipynb_checkpoints/
 
 # ======================
 #  IDE / EDITOR FILES
@@ -30,8 +26,9 @@ env/
 #  DATA / MODEL OUTPUTS
 # ======================
 
-# Your dataset (large files)
-data/
+# Ignore everything in data except the CSV splits
+data/**
+!data/*.csv
 
 # Model weights, checkpoints, runs
 runs/
