@@ -27,7 +27,7 @@ The model outputs the **disease class (0–4)** for each input image.
 Densenet121/
 ├── data/
 │   ├── train.csv              # Training data mapping
-│   ├── val.csv                # Validation data mapping
+│   ├── valid.csv                # Validation data mapping
 │   ├── test.csv               # Test data mapping
 │   └── Diabetic Retinopathy/  # Image dataset (ignored by Git)
 │
