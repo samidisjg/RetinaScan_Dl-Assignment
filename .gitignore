@@ -1,0 +1,38 @@
+# ======================
+#  IDE / EDITOR FILES
+# ======================
+.idea/
+*.iml
+.vscode/
+
+# ======================
+#  PYTHON / CACHE / ENVS
+# ======================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# ======================
+#  DATA / OUTPUTS (for all submodules)
+# ======================
+
+# Ignore data folders everywhere, but keep CSVs
+**/data/**
+!**/data/*.csv
+
+# Ignore model outputs / checkpoints / logs in any subdir
+**/runs/
+**/checkpoints/
+**/logs/
+**/report/
+**/output/
+**/figs/
+
+# ======================
+#  OS / MISC
+# ======================
+.DS_Store
+Thumbs.db
