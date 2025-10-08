@@ -1,0 +1,14 @@
+# core
+tensorflow==2.16.2
+keras==3.*
+
+# utils
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.4
+opencv-python
+albumentations
+matplotlib
+seaborn
+pyyaml
+tqdm
