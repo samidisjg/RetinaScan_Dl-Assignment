@@ -1,3 +1,4 @@
+from losses import FocalLoss
 import argparse, os, json
 import numpy as np
 import pandas as pd
@@ -12,7 +13,6 @@ from dataset import RetinaDataset
 from transforms import build_transforms
 from model_densenet121 import build_densenet121
 from utils import seed_everything, get_device, save_json
-
 
 # ----------------------------
 # Data loaders (with sampler)
@@ -35,7 +35,6 @@ def build_loaders(train_csv, val_csv, batch_size, img_size, num_workers=2):
     train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=num_workers)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,  num_workers=num_workers)
     return train_loader, val_loader, train_ds.classes
-
 
 # ----------------------------
 # Train / Eval
@@ -61,7 +60,6 @@ def train_epoch(model, loader, criterion, optimizer, device):
     f1  = f1_score(all_gts, all_preds, average="macro")
     return running_loss / len(loader.dataset), acc, f1
 
-
 @torch.no_grad()
 def eval_epoch(model, loader, criterion, device):
     model.eval()
@@ -86,7 +84,6 @@ def eval_epoch(model, loader, criterion, device):
 
     return running_loss / len(loader.dataset), acc, f1
 
-
 # ----------------------------
 # Main
 # ----------------------------
@@ -102,23 +99,47 @@ def main(args):
 
     model = build_densenet121(num_classes, pretrained=args.pretrained).to(device)
 
-    # --- param groups: freeze backbone for few epochs ---
+    # --- param groups: freeze backbone for few epochs (when pretrained) ---
     backbone_params = list(model.features.parameters())
-    head_params = list(model.classifier.parameters())
+    head_params     = list(model.classifier.parameters())
 
-    # start frozen if pretrained
-    for p in backbone_params:
-        p.requires_grad = args.pretrained  # freeze only when pretrained
-        if args.pretrained:
+    if args.pretrained:
+        for p in backbone_params:
             p.requires_grad = False
+        print(f">> Frozen backbone, training head for {args.freeze_epochs} epoch(s)")
+    else:
+        for p in backbone_params:
+            p.requires_grad = True
 
     os.makedirs(args.out_dir, exist_ok=True)
     class_to_idx = {str(c): int(i) for i, c in enumerate(classes)}
     save_json(class_to_idx, os.path.join(args.out_dir, "class_to_idx.json"))
 
-    criterion = nn.CrossEntropyLoss()
+    # ------- class-weighted loss options -------
+    train_df = pd.read_csv(args.train_csv)
+    counts = train_df["label"].value_counts().sort_index().to_numpy()
+    weights = (counts.sum() / (counts + 1e-8))
+    weights = weights / weights.mean()
+    class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
+    print("Loss class weights:", class_weights.detach().cpu().numpy())
 
-    # Optimizer: larger LR for head, smaller for backbone (when unfrozen)
+    if args.focal:
+        criterion = FocalLoss(
+            gamma=2.0,
+            weight=class_weights if args.weighted_loss else None,
+            label_smoothing=args.label_smoothing,
+            reduction="mean",
+        )
+    else:
+        def ce_loss(logits, target):
+            return nn.functional.cross_entropy(
+                logits, target,
+                weight=class_weights if args.weighted_loss else None,
+                label_smoothing=args.label_smoothing
+            )
+        criterion = ce_loss
+
+    # Optimizer: larger LR for head, smaller for backbone (while frozen)
     optimizer = AdamW([
         {"params": head_params, "lr": args.head_lr},
         {"params": backbone_params, "lr": args.backbone_lr}
@@ -132,10 +153,9 @@ def main(args):
         if args.pretrained and epoch == args.freeze_epochs + 1:
             for p in backbone_params:
                 p.requires_grad = True
-            # after unfreezing, align both LRs to a single train LR
             for pg in optimizer.param_groups:
                 pg["lr"] = args.lr
-            print(">> Unfroze backbone and set all LRs to", args.lr)
+            print(f">> Unfroze backbone and set all LRs to {args.lr}")
 
         print(f"Epoch {epoch}/{args.epochs}")
         tr_loss, tr_acc, tr_f1 = train_epoch(model, train_loader, criterion, optimizer, device)
@@ -148,8 +168,9 @@ def main(args):
         if va_f1 > best_f1:
             best_f1 = va_f1
             no_improve = 0
-            torch.save(model.state_dict(), os.path.join(args.out_dir, "best.pt"))
-            print("  saved:", os.path.join(args.out_dir, "best.pt"))
+            ckpt = os.path.join(args.out_dir, "best.pt")
+            torch.save(model.state_dict(), ckpt)
+            print("  saved:", ckpt)
         else:
             no_improve += 1
             if no_improve >= args.patience:
@@ -180,6 +201,11 @@ if __name__ == "__main__":
     # pretrained controls
     ap.add_argument("--pretrained", action="store_true")
     ap.add_argument("--freeze_epochs", type=int, default=3)
+
+    # imbalance-aware loss controls
+    ap.add_argument("--focal", action="store_true", help="Use focal loss instead of CE")
+    ap.add_argument("--weighted_loss", action="store_true", help="Apply class weights in the loss")
+    ap.add_argument("--label_smoothing", type=float, default=0.0, help="Label smoothing for CE/Focal")
 
     args = ap.parse_args()
     main(args)
