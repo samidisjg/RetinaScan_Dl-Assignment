@@ -19,11 +19,11 @@ model:
   loss_weights: {grade: 0.5, edema: 0.5}
 
 train:
-  batch_size: 16
-  epochs_stage1: 10
-  epochs_stage2: 30
+  batch_size: 32
+  epochs_stage1: 5
+  epochs_stage2: 10
   base_lr_stage1: 0.0001
-  base_lr_stage2: 0.00003
-  unfreeze_ratio: 1.0
+  base_lr_stage2: 0.00001
+  unfreeze_ratio: 0.6
   augment: true
   seed: 42
