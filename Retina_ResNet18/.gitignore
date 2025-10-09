@@ -16,6 +16,7 @@ venv/
 env/
 *.pt
 *.pth
+*.ckpt
 
 # Ignore data folders everywhere, but keep CSVs
 **/data/**
