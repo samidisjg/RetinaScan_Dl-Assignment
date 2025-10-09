@@ -1,0 +1,28 @@
+# ======================
+#  IDE / EDITOR FILES
+# ======================
+.idea/
+*.iml
+.vscode/
+
+# ======================
+#  PYTHON / CACHE / ENVS
+# ======================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.pt
+*.pth
+
+# Ignore data folders everywhere, but keep CSVs
+**/data/**
+!**/data/*.csv
+
+# ======================
+#  OS / MISC
+# ======================
+.DS_Store
+Thumbs.db
