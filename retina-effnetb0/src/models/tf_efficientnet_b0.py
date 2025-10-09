@@ -17,8 +17,8 @@ def build_effnet_b0(input_shape=(380, 380, 3), dropout=0.3, pretrained=True):
 
     feats = base(x, training=False)
     feats = keras.layers.Dropout(dropout)(feats)
-    grade = keras.layers.Dense(5, activation="softmax", name="grade")(feats)
-    edema = keras.layers.Dense(1, activation="sigmoid", name="edema")(feats)
+    grade = keras.layers.Dense(5, activation="softmax", name="grade", kernel_regularizer=regularizers.l2(1e-5))(feats)
+    edema = keras.layers.Dense(1, activation="sigmoid", name="edema", kernel_regularizer=regularizers.l2(1e-5))(feats)
 
     # <<< IMPORTANT: list (positional) outputs, but layer names remain "grade" and "edema"
     model = keras.Model(inputs=inputs, outputs=[grade, edema])
