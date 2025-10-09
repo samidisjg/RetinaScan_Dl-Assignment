@@ -1,18 +1,21 @@
+# src/train.py
 from losses import FocalLoss
-import argparse, os, json
+import argparse, os, json, csv
 import numpy as np
 import pandas as pd
 import torch, torch.nn as nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from sklearn.metrics import accuracy_score, f1_score, classification_report
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
 from tqdm import tqdm
+from copy import deepcopy
 
 from dataset import RetinaDataset
 from transforms import build_transforms
 from model_densenet121 import build_densenet121
 from utils import seed_everything, get_device, save_json
+
 
 # ----------------------------
 # Data loaders (with sampler)
@@ -36,10 +39,63 @@ def build_loaders(train_csv, val_csv, batch_size, img_size, num_workers=2):
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,  num_workers=num_workers)
     return train_loader, val_loader, train_ds.classes
 
+
+# ----------------------------
+# Utils: logging
+# ----------------------------
+def _append_history_row(out_dir, row_dict):
+    """Append training metrics to {out_dir}/history.csv (create with header if missing)."""
+    path = os.path.join(out_dir, "history.csv")
+    is_new = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row_dict.keys()))
+        if is_new:
+            writer.writeheader()
+        writer.writerow(row_dict)
+
+
+# ----------------------------
+# Class weighting (Effective Number of Samples)
+# ----------------------------
+def effective_num_weights(labels, beta=0.9999, num_classes=None):
+    # labels: pandas Series of ints
+    counts = labels.value_counts().sort_index()
+    if num_classes is not None:
+        counts = counts.reindex(range(num_classes)).fillna(0)
+    counts = counts.to_numpy().astype(float)
+    eff_num = 1.0 - np.power(beta, counts)
+    weights = (1.0 - beta) / np.maximum(eff_num, 1e-8)
+    weights = weights / weights.mean()
+    return weights
+
+
+# ----------------------------
+# MixUp + EMA helpers
+# ----------------------------
+def mixup_batch(x, y, alpha=0.2):
+    if alpha <= 0:
+        return x, y, None
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(x.size(0), device=x.device)
+    x_mix = lam * x + (1 - lam) * x[idx]
+    return x_mix, (y, y[idx]), lam
+
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    def update(self, model):
+        with torch.no_grad():
+            for k, v in model.state_dict().items():
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
+    def load_shadow(self, model):
+        model.load_state_dict(self.shadow, strict=True)
+
+
 # ----------------------------
 # Train / Eval
 # ----------------------------
-def train_epoch(model, loader, criterion, optimizer, device):
+def train_epoch(model, loader, criterion, optimizer, device, grad_clip=None, mixup_alpha=0.0, ema=None):
     model.train()
     all_preds, all_gts = [], []
     running_loss = 0.0
@@ -47,18 +103,33 @@ def train_epoch(model, loader, criterion, optimizer, device):
     for x, y in tqdm(loader, desc="Train", leave=False):
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad(set_to_none=True)
-        out = model(x)
-        loss = criterion(out, y)
+
+        if mixup_alpha > 0:
+            x, (y_a, y_b), lam = mixup_batch(x, y, alpha=mixup_alpha)
+            out = model(x)
+            loss = lam * criterion(out, y_a) + (1 - lam) * criterion(out, y_b)
+            preds = out.argmax(1)
+            all_preds.extend(preds.detach().cpu().tolist())
+            all_gts.extend(y.detach().cpu().tolist())  # metrics w.r.t. original hard labels
+        else:
+            out = model(x)
+            loss = criterion(out, y)
+            all_preds.extend(out.argmax(1).detach().cpu().tolist())
+            all_gts.extend(y.detach().cpu().tolist())
+
         loss.backward()
+        if grad_clip is not None and grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+        if ema is not None:
+            ema.update(model)
 
         running_loss += loss.item() * x.size(0)
-        all_preds.extend(out.argmax(1).detach().cpu().tolist())
-        all_gts.extend(y.detach().cpu().tolist())
 
     acc = accuracy_score(all_gts, all_preds)
     f1  = f1_score(all_gts, all_preds, average="macro")
     return running_loss / len(loader.dataset), acc, f1
+
 
 @torch.no_grad()
 def eval_epoch(model, loader, criterion, device):
@@ -82,7 +153,9 @@ def eval_epoch(model, loader, criterion, device):
     unique, cnt = np.unique(all_preds, return_counts=True)
     print("Val prediction distribution:", dict(zip(unique.tolist(), cnt.tolist())))
 
-    return running_loss / len(loader.dataset), acc, f1
+    # also return preds/gts so caller can persist best cm/report
+    return running_loss / len(loader.dataset), acc, f1, all_preds, all_gts
+
 
 # ----------------------------
 # Main
@@ -115,13 +188,11 @@ def main(args):
     class_to_idx = {str(c): int(i) for i, c in enumerate(classes)}
     save_json(class_to_idx, os.path.join(args.out_dir, "class_to_idx.json"))
 
-    # ------- class-weighted loss options -------
+    # ------- class weights (Effective Number of Samples) -------
     train_df = pd.read_csv(args.train_csv)
-    counts = train_df["label"].value_counts().sort_index().to_numpy()
-    weights = (counts.sum() / (counts + 1e-8))
-    weights = weights / weights.mean()
-    class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
-    print("Loss class weights:", class_weights.detach().cpu().numpy())
+    eff_w = effective_num_weights(train_df["label"], beta=0.9999, num_classes=num_classes)
+    class_weights = torch.tensor(eff_w, dtype=torch.float32, device=device)
+    print("Loss class weights (effective-num):", class_weights.detach().cpu().numpy())
 
     if args.focal:
         criterion = FocalLoss(
@@ -145,7 +216,15 @@ def main(args):
         {"params": backbone_params, "lr": args.backbone_lr}
     ], weight_decay=args.weight_decay)
 
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # Cosine warm restarts works well with unfreeze
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=max(args.freeze_epochs + 2, 4),
+        T_mult=2
+    )
+
+    # optional EMA
+    ema = EMA(model, decay=0.999) if args.ema else None
 
     best_f1, no_improve = -1.0, 0
     for epoch in range(1, args.epochs+1):
@@ -158,19 +237,48 @@ def main(args):
             print(f">> Unfroze backbone and set all LRs to {args.lr}")
 
         print(f"Epoch {epoch}/{args.epochs}")
-        tr_loss, tr_acc, tr_f1 = train_epoch(model, train_loader, criterion, optimizer, device)
-        va_loss, va_acc, va_f1 = eval_epoch(model, val_loader, criterion, device)
-        scheduler.step()
+        tr_loss, tr_acc, tr_f1 = train_epoch(
+            model, train_loader, criterion, optimizer, device,
+            grad_clip=args.grad_clip, mixup_alpha=args.mixup_alpha, ema=ema
+        )
+        va_loss, va_acc, va_f1, va_preds, va_gts = eval_epoch(model, val_loader, criterion, device)
+        scheduler.step(epoch - 1 + 1e-8)  # align phase for WarmRestarts
 
         print(f"  train: loss={tr_loss:.4f} acc={tr_acc:.4f} f1={tr_f1:.4f}")
         print(f"  valid: loss={va_loss:.4f} acc={va_acc:.4f} f1={va_f1:.4f}")
+
+        _append_history_row(args.out_dir, {
+            "epoch": epoch,
+            "train_loss": f"{tr_loss:.6f}",
+            "train_acc": f"{tr_acc:.6f}",
+            "train_f1": f"{tr_f1:.6f}",
+            "val_loss": f"{va_loss:.6f}",
+            "val_acc": f"{va_acc:.6f}",
+            "val_f1": f"{va_f1:.6f}",
+        })
 
         if va_f1 > best_f1:
             best_f1 = va_f1
             no_improve = 0
             ckpt = os.path.join(args.out_dir, "best.pt")
-            torch.save(model.state_dict(), ckpt)
+
+            if ema is not None:
+                # Save EMA weights
+                bak = deepcopy(model.state_dict())
+                ema.load_shadow(model)
+                torch.save(model.state_dict(), ckpt)
+                model.load_state_dict(bak)
+            else:
+                torch.save(model.state_dict(), ckpt)
+
             print("  saved:", ckpt)
+
+            # also persist best report + confusion matrix
+            report_txt = classification_report(va_gts, va_preds, digits=4, zero_division=0)
+            with open(os.path.join(args.out_dir, "report_best.txt"), "w") as f:
+                f.write(report_txt)
+            cm = confusion_matrix(va_gts, va_preds)
+            np.save(os.path.join(args.out_dir, "cm_best.npy"), cm)
         else:
             no_improve += 1
             if no_improve >= args.patience:
@@ -178,6 +286,7 @@ def main(args):
                 break
 
     print(f"Best val macro-F1: {best_f1:.4f}")
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -197,6 +306,7 @@ if __name__ == "__main__":
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--patience", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--grad_clip", type=float, default=1.0, help="Max grad-norm (0 to disable)")
 
     # pretrained controls
     ap.add_argument("--pretrained", action="store_true")
@@ -206,6 +316,10 @@ if __name__ == "__main__":
     ap.add_argument("--focal", action="store_true", help="Use focal loss instead of CE")
     ap.add_argument("--weighted_loss", action="store_true", help="Apply class weights in the loss")
     ap.add_argument("--label_smoothing", type=float, default=0.0, help="Label smoothing for CE/Focal")
+
+    # new options
+    ap.add_argument("--ema", action="store_true", help="Use EMA of model weights")
+    ap.add_argument("--mixup_alpha", type=float, default=0.2, help="MixUp alpha; 0 disables MixUp")
 
     args = ap.parse_args()
     main(args)
