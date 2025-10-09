@@ -1,29 +1,37 @@
-# ======================
-#  IDE / EDITOR FILES
-# ======================
+# IDE / EDITOR FILES
 .idea/
 *.iml
 .vscode/
 
-# ======================
-#  PYTHON / CACHE / ENVS
-# ======================
+# PYTHON / CACHE / ENVS
 __pycache__/
 *.py[cod]
 *$py.class
 .venv/
 venv/
 env/
+
+# MODEL FILES
 *.pt
 *.pth
 *.ckpt
 
-# Ignore data folders everywhere, but keep CSVs
+# DATA FILES
+# Ignore all data folders
 **/data/**
+
+# Except CSVs
 !**/data/*.csv
 
-# ======================
-#  OS / MISC
-# ======================
+# IMAGE / TEXT / JSON FILES
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.txt
+*.json
+
+# OS / MISC
 .DS_Store
 Thumbs.db
