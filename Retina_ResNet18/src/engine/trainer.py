@@ -69,6 +69,10 @@ class Trainer:
         grade_meter = AvgMeter()
         edema_meter = AvgMeter()
 
+        # accumulate for train metrics
+        all_g_true, all_g_pred = [], []
+        all_e_true, all_e_prob = [], []
+
         pbar = tqdm(self.train_loader, desc=f"Train {epoch}")
         for imgs, y_grade, y_edema in pbar:
             imgs = imgs.to(self.device, non_blocking=True)
@@ -76,24 +80,34 @@ class Trainer:
             y_edema = y_edema.to(self.device)
 
             self.optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(self.device.type, enabled=bool(getattr(self.cfg, "amp", True) and torch.cuda.is_available())):
+            with torch.amp.autocast(
+                self.device.type,
+                enabled=bool(getattr(self.cfg, "amp", True) and torch.cuda.is_available())
+            ):
                 logits_g, logit_e = self.model(imgs)
                 loss, lg, le = multitask_loss(
-                    logits_g,
-                    logit_e,
-                    y_grade,
-                    y_edema,
+                    logits_g, logit_e, y_grade, y_edema,
                     label_smoothing=self.label_smoothing,
                     grade_weights=self.grade_weights,
                     edema_pos_weight=self.edema_pos_weight,
                 )
+
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            loss_meter.update(loss.item(), imgs.size(0))
-            grade_meter.update(lg, imgs.size(0))
-            edema_meter.update(le, imgs.size(0))
+            # meters for losses
+            bs = imgs.size(0)
+            loss_meter.update(loss.item(), bs)
+            grade_meter.update(lg, bs)
+            edema_meter.update(le, bs)
+
+            # accumulate for metrics (detach -> cpu)
+            all_g_true.append(y_grade.detach().cpu())
+            all_g_pred.append(logits_g.detach().argmax(1).cpu())
+            all_e_true.append(y_edema.detach().cpu())
+            all_e_prob.append(torch.sigmoid(logit_e.detach()).cpu())
+
             pbar.set_postfix(
                 loss=f"{loss_meter.avg:.4f}",
                 grade=f"{grade_meter.avg:.4f}",
@@ -101,10 +115,21 @@ class Trainer:
             )
 
         self.scheduler.step()
+
+        # compute TRAIN metrics for the epoch
+        y_true_g = torch.cat(all_g_true).numpy()
+        y_pred_g = torch.cat(all_g_pred).numpy()
+        y_true_e = torch.cat(all_e_true).numpy()
+        y_prob_e = torch.cat(all_e_prob).numpy()
+        m = compute_metrics(y_true_g, y_pred_g, y_true_e, y_prob_e)
+
         return {
             "loss": loss_meter.avg,
             "loss_grade": grade_meter.avg,
             "loss_edema": edema_meter.avg,
+            "grade_acc": float(m["grade_acc"]),
+            "grade_f1_macro": float(m["grade_f1_macro"]),
+            "edema_auc": float(m["edema_auc"]),
         }
 
     @torch.no_grad()
@@ -121,10 +146,7 @@ class Trainer:
 
             logits_g, logit_e = self.model(imgs)
             loss, _, _ = multitask_loss(
-                logits_g,
-                logit_e,
-                y_grade,
-                y_edema,
+                logits_g, logit_e, y_grade, y_edema,
                 label_smoothing=0.0,
                 grade_weights=self.grade_weights,
                 edema_pos_weight=self.edema_pos_weight,
