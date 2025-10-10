@@ -1,40 +1,82 @@
-import os, random
-ap = argparse.ArgumentParser()
-ap.add_argument('--cfg', default='configs/resnet18.yaml')
-ap.add_argument('--ckpt', required=True)
-ap.add_argument('--num', type=int, default=12)
-args = ap.parse_args()
+# scripts/gradcam.py
+import sys, os, torch, cv2, numpy as np
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from src.config import load_config
+from src.datasets.retina import RetinaDataset
+from src.models.resnet18_multitask import ResNet18MultiTask
 
+def apply_colormap(img, mask):
+    mask = (255 * (mask - mask.min()) / (mask.max() - mask.min() + 1e-8)).astype(np.uint8)
+    heat = cv2.applyColorMap(mask, cv2.COLORMAP_JET)
+    heat = cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
+    out = (0.5 * img + 0.5 * heat).astype(np.uint8)
+    return out
 
-cfg = load_config(args.cfg)
-ds = RetinaDataset(
-csv_path=os.path.join(cfg.data_dir, cfg.valid_csv),
-img_dir=os.path.join(cfg.data_dir, cfg.valid_img_dir),
-col_image=cfg.columns.image, col_grade=cfg.columns.grade, col_edema=cfg.columns.edema,
-img_size=cfg.img_size, center_crop=cfg.center_crop, is_train=False)
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cfg", default="configs/resnet18.yaml")
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--split", default="valid", choices=["train","valid","test"])
+    ap.add_argument("--num", type=int, default=12)
+    args = ap.parse_args()
 
+    cfg = load_config(args.cfg)
+    if args.split == "train":
+        csv_rel, img_rel = cfg.train_csv, cfg.train_img_dir
+    elif args.split == "valid":
+        csv_rel, img_rel = cfg.valid_csv, cfg.valid_img_dir
+    else:
+        csv_rel, img_rel = cfg.test_csv, cfg.test_img_dir
 
-model = ResNet18MultiTask(num_classes_grade=cfg.num_classes_grade)
-state = torch.load(args.ckpt, map_location='cpu')
-model.load_state_dict(state['model_state'])
+    ds = RetinaDataset(
+        csv_path=os.path.join(cfg.data_dir, csv_rel),
+        img_dir=os.path.join(cfg.data_dir, img_rel),
+        col_image=cfg.columns.image,
+        col_grade=cfg.columns.grade,
+        col_edema=cfg.columns.edema,
+        img_size=int(cfg.img_size),
+        center_crop=getattr(cfg, "center_crop", None),
+        is_train=False,
+    )
 
+    state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    model = ResNet18MultiTask(num_classes_grade=int(cfg.num_classes_grade))
+    model.load_state_dict(state["model_state"])
+    model.eval()
 
-gc = GradCAM(model, target_layer=cfg.gradcam.target_layer)
-out_dir = os.path.join(os.path.dirname(args.ckpt), 'gradcam')
-os.makedirs(out_dir, exist_ok=True)
+    # target conv layer
+    target = model.features[-1]  # layer4.1.conv2 output after pool block
+    feats, grads = [], []
+    def f_hook(_, __, output): feats.append(output.detach())
+    def b_hook(_, grad_in, grad_out): grads.append(grad_out[0].detach())
+    h1 = target.register_forward_hook(f_hook)
+    h2 = target.register_full_backward_hook(b_hook)
 
+    out_dir = os.path.join(os.path.dirname(args.ckpt), f"gradcam_{args.split}")
+    os.makedirs(out_dir, exist_ok=True)
 
-idxs = random.sample(range(len(ds)), k=min(args.num, len(ds)))
-for i in idxs:
-img, yg, ye = ds[i]
-cam = gc(img, target='grade')
-# to numpy image (H,W,3)
-img_np = (img.permute(1,2,0).numpy() * [0.229,0.224,0.225] + [0.485,0.456,0.406])
-img_np = np.clip(img_np, 0, 1)
-cam_resized = cv2.resize(cam, (img_np.shape[1], img_np.shape[0]))
-heatmap = cv2.applyColorMap((cam_resized*255).astype(np.uint8), cv2.COLORMAP_JET)
-heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)/255.0
-overlay = (0.4*heatmap + 0.6*img_np)
-out = (overlay*255).astype(np.uint8)
-cv2.imwrite(os.path.join(out_dir, f"cam_{i}.png"), cv2.cvtColor(out, cv2.COLOR_RGB2BGR))
-print(f"Saved Grad-CAM images to {out_dir}")
+    for i in range(min(args.num, len(ds))):
+        img_t, yg, ye = ds[i]  # CHW
+        img = (img_t.permute(1,2,0).numpy() * 255.0).clip(0,255).astype(np.uint8)  # de-normalized *roughly*
+        x = img_t.unsqueeze(0)
+        feats.clear(); grads.clear()
+
+        # backprop from predicted grade class
+        lg, le = model(x)
+        cls = lg.argmax(1).item()
+        score = lg[0, cls]
+        model.zero_grad(set_to_none=True)
+        score.backward()
+
+        A = feats[-1][0]           # [C, H, W]
+        G = grads[-1][0]           # [C, H, W]
+        weights = G.mean(dim=(1,2), keepdim=True)  # [C,1,1]
+        cam = torch.relu((weights * A).sum(0)).cpu().numpy()  # [H, W]
+        cam = cv2.resize(cam, (img.shape[1], img.shape[0]))
+
+        over = apply_colormap(img, cam)
+        cv2.imwrite(os.path.join(out_dir, f"idx{i:03d}_pred{cls}_gradcam.png"),
+                    cv2.cvtColor(over, cv2.COLOR_RGB2BGR))
+    h1.remove(); h2.remove()
+    print("Saved Grad-CAMs to:", out_dir)
