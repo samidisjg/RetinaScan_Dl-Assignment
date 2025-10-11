@@ -1,11 +1,12 @@
-import os, torch, timm, numpy as np
+import os, torch, timm
 from pathlib import Path
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch import nn
 from tqdm import tqdm
 from .dataset import CSVDataset
-from sklearn.metrics import classification_report, balanced_accuracy_score, f1_score
+from sklearn.metrics import classification_report, balanced_accuracy_score
 import pandas as pd
+import numpy as np
 
 DEVICE = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -14,41 +15,8 @@ SPLITS = ROOT / "splits"
 
 print(SPLITS)
 
-# -------------------- Losses & helpers --------------------
-def class_balanced_weights(counts, beta=0.999):
-    c = torch.tensor(counts, dtype=torch.float)
-    w = (1 - beta) / (1 - torch.pow(beta, c))
-    w = w / w.mean()
-    return w.float()
-
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, weight=None, reduction='mean'):
-        super().__init__()
-        self.gamma = gamma
-        self.weight = weight
-        self.reduction = reduction
-    def forward(self, logits, target):
-        logp = nn.functional.log_softmax(logits, dim=1)
-        p = torch.exp(logp)
-        pt = p.gather(1, target.unsqueeze(1)).squeeze(1)
-        nll = nn.functional.nll_loss(logp, target, weight=self.weight, reduction='none')
-        loss = ((1 - pt) ** self.gamma) * nll
-        return loss.mean() if self.reduction == 'mean' else loss.sum()
-
-def mixup_batch(x, y, alpha=0.4):
-    if alpha <= 0:
-        return x, y, None
-    lam = np.random.beta(alpha, alpha)
-    idx = torch.randperm(x.size(0), device=x.device)
-    mixed = lam * x + (1 - lam) * x[idx]
-    return mixed, (y, y[idx], lam), idx
-
-def mixup_criterion(criterion, pred, y_tuple):
-    y_a, y_b, lam = y_tuple
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-
 # -------------------- Imbalance: Weighted Sampler --------------------
-def _build_weighted_sampler(train_csv, classes, class2_boost=1.4):
+def _build_weighted_sampler(train_csv, classes):
     df = pd.read_csv(train_csv).reset_index(drop=True)
     class_to_idx = {c: i for i, c in enumerate(sorted(classes))}
     labels_idx = df["label"].map(class_to_idx).to_numpy()
@@ -56,13 +24,7 @@ def _build_weighted_sampler(train_csv, classes, class2_boost=1.4):
     num_classes = len(classes)
     counts = np.bincount(labels_idx, minlength=num_classes)
     counts = np.maximum(counts, 1)
-
-    # inverse-sqrt weights
-    class_weights = 1.0 / torch.sqrt(torch.tensor(counts, dtype=torch.float))
-    # gentle push for class 2
-    if num_classes > 2:
-        class_weights[2] *= class2_boost
-    class_weights = class_weights / class_weights.mean()
+    class_weights = 1.0 / torch.tensor(counts, dtype=torch.float)
 
     sample_weights = class_weights[torch.from_numpy(labels_idx)]
     sampler = WeightedRandomSampler(
@@ -71,8 +33,8 @@ def _build_weighted_sampler(train_csv, classes, class2_boost=1.4):
         replacement=True
     )
     print("Class counts:", {i: int(c) for i, c in enumerate(counts)})
-    print("Class weights (inv sqrt, c2 boosted):", class_weights.tolist())
-    return sampler, counts
+    print("Class weights (inv freq):", class_weights.tolist())
+    return sampler
 
 # -------------------- Freeze / Unfreeze helpers --------------------
 def _head_param_names(model):
@@ -88,58 +50,59 @@ def freeze_backbone_train_head(model):
 
 def unfreeze_stages_3_4_and_head(model):
     # ConvNeXt in timm: model.stages[0..3], model.head
-    for p in model.parameters(): p.requires_grad = False
-    for p in model.stages[2].parameters(): p.requires_grad = True  # stage 3
-    for p in model.stages[3].parameters(): p.requires_grad = True  # stage 4
-    for p in model.head.parameters():      p.requires_grad = True
+    for p in model.parameters():
+        p.requires_grad = False
+    # unfreeze deeper stages + head
+    for p in model.stages[2].parameters():  # stage 3
+        p.requires_grad = True
+    for p in model.stages[3].parameters():  # stage 4
+        p.requires_grad = True
+    for p in model.head.parameters():
+        p.requires_grad = True
 
 def unfreeze_all(model):
-    for p in model.parameters(): p.requires_grad = True
+    for p in model.parameters():
+        p.requires_grad = True
 
 def build_optimizer(model, lr_backbone, lr_head, weight_decay, train_head_only=False):
     head_names = _head_param_names(model)
     if train_head_only:
         params = [p for n, p in model.named_parameters() if p.requires_grad and (n in head_names)]
         return torch.optim.AdamW(params, lr=lr_head, weight_decay=weight_decay)
+
     backbone_params = [p for n, p in model.named_parameters() if p.requires_grad and (n not in head_names)]
     head_params     = [p for n, p in model.named_parameters() if p.requires_grad and (n in head_names)]
     groups = []
-    if backbone_params: groups.append({"params": backbone_params, "lr": lr_backbone})
-    if head_params:     groups.append({"params": head_params,     "lr": lr_head})
+    if backbone_params:
+        groups.append({"params": backbone_params, "lr": lr_backbone})
+    if head_params:
+        groups.append({"params": head_params, "lr": lr_head})
     return torch.optim.AdamW(groups, weight_decay=weight_decay)
 
 def current_lrs(optimizer):
-    return [round(g["lr"], 8) for g in optimizer.param_groups]
+    return [g["lr"] for g in optimizer.param_groups]
 
 # -------------------- Train / Eval --------------------
 def run(train_csv=SPLITS / "train.csv",
         val_csv=SPLITS / "val.csv",
-        out="checkpoints/convnext_tiny_third.pt",
-        size=320, batch_size=24, epochs=24,
+        out="checkpoints/convnext_tiny_second.pt",
+        size=224, batch_size=32, epochs=37,
         # Phase controls
-        freeze_epochs=3,
-        partial_unfreeze=True,
-        full_unfreeze_at=None,
+        freeze_epochs=2,                 # Phase-1 (head only)
+        partial_unfreeze=True,           # unfreeze stages 3-4 + head first
+        full_unfreeze_at=None,           # e.g., 8 => after 8 epochs of phase-2, unfreeze all; None to skip
         # LRs & WD
         lr_head_phase1=1e-3,
-        lr_backbone_phase2=3e-5,
-        lr_head_phase2=8e-5,
+        lr_backbone_phase2=5e-5,
+        lr_head_phase2=1e-4,
         weight_decay_phase1=1e-4,
         weight_decay_phase2=1e-5,
         # Warmup
-        warmup_epochs_phase2=3,
+        warmup_epochs_phase2=2,
         # Other
         grad_clip=1.0,
-        mixup_alpha=0.35,
-        # Sampler
-        use_weighted_sampler=True,
-        class2_sampler_boost=1.4,
-        # Loss tweaks
-        focal_gamma=2.0,
-        cb_beta=0.999,
-        class2_loss_boost=1.3,
-        # Logit adjustment
-        tau_logit_adjust=0.5):
+        label_smoothing=0.05,
+        use_weighted_sampler=True):
 
     # Classes
     classes = sorted(pd.read_csv(train_csv)["label"].unique().tolist())
@@ -149,38 +112,25 @@ def run(train_csv=SPLITS / "train.csv",
     val_ds   = CSVDataset(val_csv,   classes=classes, train=False, size=size)
 
     if use_weighted_sampler:
-        sampler, counts = _build_weighted_sampler(train_csv, classes, class2_boost=class2_sampler_boost)
+        sampler = _build_weighted_sampler(train_csv, classes)
         train_dl = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
-                              num_workers=0, pin_memory=True, drop_last=True)
+                              num_workers=0, pin_memory=True)
     else:
-        # still need counts for priors/loss
-        df_tmp = pd.read_csv(train_csv)
-        counts = df_tmp["label"].value_counts().sort_index().reindex(classes).fillna(0).astype(int).to_numpy()
         train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=0, pin_memory=True, drop_last=True)
+                              num_workers=0, pin_memory=True)
 
     val_dl   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
                           num_workers=0, pin_memory=True)
-
-    # Priors for logit adjustment
-    priors = torch.tensor(counts / np.maximum(counts.sum(), 1), dtype=torch.float, device=DEVICE)
-
-    def adjust_logits(logits):
-        # prior correction
-        return logits + tau_logit_adjust * torch.log(priors + 1e-12)
 
     # Model
     model = timm.create_model("convnext_tiny.in12k_ft_in1k",
                               pretrained=True, num_classes=len(classes))
     model.to(DEVICE)
 
-    # Class-balanced focal loss
-    cbw = class_balanced_weights(counts, beta=cb_beta).to(DEVICE)
-    if len(cbw) > 2:
-        cbw[2] *= class2_loss_boost  # extra nudge for class 2
-    loss_fn = FocalLoss(gamma=focal_gamma, weight=cbw)
+    # Loss
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
-    best_score = -1.0  # macro-F1 based saving
+    best_acc = 0.0
     os.makedirs(os.path.dirname(out), exist_ok=True)
 
     # -------------------- Phase-1: train head only --------------------
@@ -201,29 +151,17 @@ def run(train_csv=SPLITS / "train.csv",
             for xb, yb in tqdm(train_dl, desc=f"Train (Phase-1) {ep}/{phase1_epochs}"):
                 xb, yb = xb.to(DEVICE), yb.to(DEVICE)
                 opt.zero_grad()
-                x_in, mix = xb, None
-                if mixup_alpha and mixup_alpha > 0:
-                    x_in, mix, _ = mixup_batch(xb, yb, alpha=mixup_alpha)
-
-                logits = model(x_in)
-                logits = adjust_logits(logits)
-
-                if mix is None:
-                    loss = loss_fn(logits, yb)
-                    pred = logits.argmax(1)
-                    total += yb.size(0)
-                    correct += (pred == yb).sum().item()
-                else:
-                    loss = mixup_criterion(loss_fn, logits, mix)
-                    # for acc, use argmax vs original y
-                    pred = logits.argmax(1)
-                    total += yb.size(0)
-                    correct += (pred == yb).sum().item()
-
+                logits = model(xb)
+                loss = loss_fn(logits, yb)
                 loss.backward()
-                if grad_clip: nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                if grad_clip:
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 opt.step()
+
                 running_loss += loss.item() * xb.size(0)
+                pred = logits.argmax(1)
+                total += yb.size(0)
+                correct += (pred == yb).sum().item()
 
             # Validate
             model.eval()
@@ -233,7 +171,6 @@ def run(train_csv=SPLITS / "train.csv",
                 for xb, yb in tqdm(val_dl, desc="Val"):
                     xb, yb = xb.to(DEVICE), yb.to(DEVICE)
                     logits = model(xb)
-                    logits = adjust_logits(logits)
                     loss = loss_fn(logits, yb)
                     vloss += loss.item() * xb.size(0)
                     pred = logits.argmax(1)
@@ -247,15 +184,14 @@ def run(train_csv=SPLITS / "train.csv",
             val_acc = vcorrect / max(1, vtotal)
             val_loss = vloss / max(1, vtotal)
             bal_acc = balanced_accuracy_score(all_true, all_pred) if all_true else 0.0
-            macro_f1 = f1_score(all_true, all_pred, average='macro') if all_true else 0.0
 
             print(f"[Phase-1] Epoch {ep}: train_loss={train_loss:.4f} acc={train_acc:.3f} | "
-                  f"val_loss={val_loss:.4f} acc={val_acc:.3f} bal_acc={bal_acc:.3f} macroF1={macro_f1:.3f} | lrs={current_lrs(opt)}")
+                  f"val_loss={val_loss:.4f} acc={val_acc:.3f} bal_acc={bal_acc:.3f} | lrs={current_lrs(opt)}")
 
-            if macro_f1 > best_score:
-                best_score = macro_f1
+            if val_acc > best_acc:
+                best_acc = val_acc
                 torch.save({"model": model.state_dict(), "classes": classes}, out)
-                print(f"✓ Saved (macroF1={macro_f1:.3f}):", out)
+                print("✓ Saved:", out)
 
             sched.step()
 
@@ -288,6 +224,7 @@ def run(train_csv=SPLITS / "train.csv",
             # optional switch to full unfreeze after some epochs
             if full_unfreeze_at is not None and ep == full_unfreeze_at:
                 unfreeze_all(model)
+                # rebuild optimizer to include all params
                 opt = build_optimizer(model,
                                       lr_backbone=bb_base,
                                       lr_head=hd_base,
@@ -309,28 +246,17 @@ def run(train_csv=SPLITS / "train.csv",
             for xb, yb in tqdm(train_dl, desc=f"Train (Phase-2) {ep}/{phase2_epochs}"):
                 xb, yb = xb.to(DEVICE), yb.to(DEVICE)
                 opt.zero_grad()
-                x_in, mix = xb, None
-                if mixup_alpha and mixup_alpha > 0:
-                    x_in, mix, _ = mixup_batch(xb, yb, alpha=mixup_alpha)
-
-                logits = model(x_in)
-                logits = adjust_logits(logits)
-
-                if mix is None:
-                    loss = loss_fn(logits, yb)
-                    pred = logits.argmax(1)
-                    total += yb.size(0)
-                    correct += (pred == yb).sum().item()
-                else:
-                    loss = mixup_criterion(loss_fn, logits, mix)
-                    pred = logits.argmax(1)
-                    total += yb.size(0)
-                    correct += (pred == yb).sum().item()
-
+                logits = model(xb)
+                loss = loss_fn(logits, yb)
                 loss.backward()
-                if grad_clip: nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                if grad_clip:
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 opt.step()
+
                 running_loss += loss.item() * xb.size(0)
+                pred = logits.argmax(1)
+                total += yb.size(0)
+                correct += (pred == yb).sum().item()
 
             # Validate
             model.eval()
@@ -340,7 +266,6 @@ def run(train_csv=SPLITS / "train.csv",
                 for xb, yb in tqdm(val_dl, desc="Val"):
                     xb, yb = xb.to(DEVICE), yb.to(DEVICE)
                     logits = model(xb)
-                    logits = adjust_logits(logits)
                     loss = loss_fn(logits, yb)
                     vloss += loss.item() * xb.size(0)
                     pred = logits.argmax(1)
@@ -354,17 +279,16 @@ def run(train_csv=SPLITS / "train.csv",
             val_acc = vcorrect / max(1, vtotal)
             val_loss = vloss / max(1, vtotal)
             bal_acc = balanced_accuracy_score(all_true, all_pred) if all_true else 0.0
-            macro_f1 = f1_score(all_true, all_pred, average='macro') if all_true else 0.0
 
             print(f"[Phase-2] Epoch {ep}: train_loss={train_loss:.4f} acc={train_acc:.3f} | "
-                  f"val_loss={val_loss:.4f} acc={val_acc:.3f} bal_acc={bal_acc:.3f} macroF1={macro_f1:.3f} | lrs={current_lrs(opt)}")
+                  f"val_loss={val_loss:.4f} acc={val_acc:.3f} bal_acc={bal_acc:.3f} | lrs={current_lrs(opt)}")
 
-            if macro_f1 > best_score:
-                best_score = macro_f1
+            if val_acc > best_acc:
+                best_acc = val_acc
                 torch.save({"model": model.state_dict(), "classes": classes}, out)
-                print(f"✓ Saved (macroF1={macro_f1:.3f}):", out)
+                print("✓ Saved:", out)
 
-        sched.step()
+            sched.step()
 
     # --------- Final per-class report on validation set ---------
     label_ids = list(range(len(classes)))
