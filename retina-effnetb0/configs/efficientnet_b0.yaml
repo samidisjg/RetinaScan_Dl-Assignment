@@ -1,0 +1,29 @@
+project: retina-effnetb0
+
+paths:
+  data_root: data_preprocessed
+  train_dir: data_preprocessed/train
+  valid_dir: data_preprocessed/valid
+  test_dir:  data_preprocessed/test
+  train_csv: data_preprocessed/train/annotations_balanced.csv
+  valid_csv: data_preprocessed/valid/annotations.csv
+  test_csv:  data_preprocessed/test/annotations.csv
+
+out:
+  run_dir: runs/effnet_b0
+  ckpt: runs/effnet_b0/best.keras
+
+model:
+  input_shape: [380, 380, 3]
+  dropout: 0.4
+  loss_weights: {grade: 0.5, edema: 0.5}
+
+train:
+  batch_size: 32
+  epochs_stage1: 5
+  epochs_stage2: 10
+  base_lr_stage1: 0.0001
+  base_lr_stage2: 0.00001
+  unfreeze_ratio: 0.6
+  augment: true
+  seed: 42

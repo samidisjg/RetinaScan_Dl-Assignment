@@ -1,0 +1,9 @@
+              precision    recall  f1-score   support
+
+    no_edema     0.9540    0.8382    0.8924       272
+       edema     0.5600    0.8358    0.6707        67
+
+    accuracy                         0.8378       339
+   macro avg     0.7570    0.8370    0.7815       339
+weighted avg     0.8761    0.8378    0.8485       339
+
