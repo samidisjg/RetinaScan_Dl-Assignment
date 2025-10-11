@@ -1,0 +1,53 @@
+# Path config
+seed: 1337
+project_name: "retina-resnet18"
+output_dir: "outputs"
+data_dir: "data"
+train_csv: "train/annotations.csv"
+valid_csv: "valid/annotations.csv"
+test_csv: "test/annotations.csv"
+train_img_dir: "train/images"
+valid_img_dir: "valid/images"
+test_img_dir: "test/images"
+
+
+# Column names in CSV (change if Kaggle names differ)
+columns:
+  image: "Image name"
+  grade: "Retinopathy grade"
+  edema: "Risk of macular edema"
+
+loss:
+  grade_class_weights: [0.1874, 0.7542, 0.434, 1.3394, 2.2849]
+  edema_pos_weight: 4.1036       
+
+
+# Training config
+num_classes_grade: 5
+amp: true
+num_workers: 4
+batch_size: 32
+epochs: 10
+optim: "adamw"
+lr: 3e-4
+weight_decay: 1e-4
+scheduler: "cosine"
+warmup_epochs: 2
+label_smoothing: 0.05
+num_workers: 0      # use 0 on Windows CPU to avoid worker issues
+patience: 7
+
+# Augmentations / image
+img_size: 384
+center_crop: 352
+
+
+# Checkpointing & logging
+save_top_k: 3
+patience: 7
+
+
+# Grad-CAM settings
+gradcam:
+  target_layer: "layer4.1.conv2" # for ResNet18
+  num_samples: 12
