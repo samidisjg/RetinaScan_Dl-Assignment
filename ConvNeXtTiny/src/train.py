@@ -1,10 +1,10 @@
-import os, torch, timm
+import os, csv, torch, timm
 from pathlib import Path
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch import nn
 from tqdm import tqdm
 from .dataset import CSVDataset
-from sklearn.metrics import classification_report, balanced_accuracy_score
+from sklearn.metrics import classification_report, balanced_accuracy_score, f1_score
 import pandas as pd
 import numpy as np
 
@@ -130,8 +130,21 @@ def run(train_csv=SPLITS / "train.csv",
     # Loss
     loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
-    best_acc = 0.0
+    # ---- history logging (CSV) ----
+    best_score = -1.0  # macro-F1
+    history = []
+    history_path = os.path.join(os.path.dirname(out), "history/history_convnext_tiny.csv")
     os.makedirs(os.path.dirname(out), exist_ok=True)
+
+    def log_epoch(phase, epoch, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1, lrs):
+        history.append({
+            "phase": phase, "epoch": epoch,
+            "train_loss": train_loss, "train_acc": train_acc,
+            "val_loss": val_loss, "val_acc": val_acc,
+            "balanced_acc": bal_acc, "macro_f1": macro_f1,
+            "lr_0": lrs[0] if len(lrs) > 0 else 0.0,
+            "lr_1": lrs[1] if len(lrs) > 1 else 0.0,
+        })
 
     # -------------------- Phase-1: train head only --------------------
     phase1_epochs = max(0, min(freeze_epochs, epochs))
@@ -184,18 +197,20 @@ def run(train_csv=SPLITS / "train.csv",
             val_acc = vcorrect / max(1, vtotal)
             val_loss = vloss / max(1, vtotal)
             bal_acc = balanced_accuracy_score(all_true, all_pred) if all_true else 0.0
+            macro_f1 = f1_score(all_true, all_pred, average='macro') if all_true else 0.0
 
             print(f"[Phase-1] Epoch {ep}: train_loss={train_loss:.4f} acc={train_acc:.3f} | "
-                  f"val_loss={val_loss:.4f} acc={val_acc:.3f} bal_acc={bal_acc:.3f} | lrs={current_lrs(opt)}")
+                  f"val_loss={val_loss:.4f} acc={val_acc:.3f} bal_acc={bal_acc:.3f} macroF1={macro_f1:.3f} | lrs={current_lrs(opt)}")
 
-            if val_acc > best_acc:
-                best_acc = val_acc
+            if macro_f1 > best_score:
+                best_score = macro_f1
                 torch.save({"model": model.state_dict(), "classes": classes}, out)
-                print("✓ Saved:", out)
+                print(f"✓ Saved (macroF1={macro_f1:.3f}):", out)
 
+            log_epoch("Phase-1", ep, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1, current_lrs(opt))
             sched.step()
 
-    # -------------------- Phase-2: fine-tune  --------------------
+    # -------------------- Phase-2: fine-tune (partial → optional full) --------------------
     phase2_epochs = epochs - phase1_epochs
     if phase2_epochs > 0:
         if partial_unfreeze:
@@ -210,7 +225,7 @@ def run(train_csv=SPLITS / "train.csv",
                               train_head_only=False)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=phase2_epochs)
 
-        # start at 0.1x lr then linearly ramp to base over warmup_epochs
+        # Warmup: start at 0.1x lr then linearly ramp to base over warmup_epochs
         warmup_epochs = min(warmup_epochs_phase2, phase2_epochs)
         bb_base, hd_base = lr_backbone_phase2, lr_head_phase2
         for g in opt.param_groups:
@@ -224,7 +239,6 @@ def run(train_csv=SPLITS / "train.csv",
             # optional switch to full unfreeze after some epochs
             if full_unfreeze_at is not None and ep == full_unfreeze_at:
                 unfreeze_all(model)
-                # rebuild optimizer to include all params
                 opt = build_optimizer(model,
                                       lr_backbone=bb_base,
                                       lr_head=hd_base,
@@ -279,15 +293,17 @@ def run(train_csv=SPLITS / "train.csv",
             val_acc = vcorrect / max(1, vtotal)
             val_loss = vloss / max(1, vtotal)
             bal_acc = balanced_accuracy_score(all_true, all_pred) if all_true else 0.0
+            macro_f1 = f1_score(all_true, all_pred, average='macro') if all_true else 0.0
 
             print(f"[Phase-2] Epoch {ep}: train_loss={train_loss:.4f} acc={train_acc:.3f} | "
-                  f"val_loss={val_loss:.4f} acc={val_acc:.3f} bal_acc={bal_acc:.3f} | lrs={current_lrs(opt)}")
+                  f"val_loss={val_loss:.4f} acc={val_acc:.3f} bal_acc={bal_acc:.3f} macroF1={macro_f1:.3f} | lrs={current_lrs(opt)}")
 
-            if val_acc > best_acc:
-                best_acc = val_acc
+            if macro_f1 > best_score:
+                best_score = macro_f1
                 torch.save({"model": model.state_dict(), "classes": classes}, out)
-                print("✓ Saved:", out)
+                print(f"✓ Saved (macroF1={macro_f1:.3f}):", out)
 
+            log_epoch("Phase-2", ep, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1, current_lrs(opt))
             sched.step()
 
     # --------- Final per-class report on validation set ---------
@@ -300,6 +316,14 @@ def run(train_csv=SPLITS / "train.csv",
         zero_division=0,
         digits=4
     ))
+
+    # ---- write history CSV ----
+    if len(history) > 0:
+        with open(history_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+            writer.writeheader()
+            writer.writerows(history)
+        print("Saved training history to:", history_path)
 
 if __name__ == "__main__":
     run()
