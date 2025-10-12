@@ -24,7 +24,6 @@ env/
 !**/data/*.csv
 
 # Ignore model outputs / checkpoints / logs in any subdir
-**/runs/
 **/checkpoints/
 **/logs/
 **/report/
@@ -36,3 +35,11 @@ env/
 # ======================
 .DS_Store
 Thumbs.db
+
+# ======================
+# Ignore runs folders everywhere, but keep png
+# ======================
+**/runs/**
+!**/runs/*.png
+!**/runs/*.csv
+!**/runs/*.txt
