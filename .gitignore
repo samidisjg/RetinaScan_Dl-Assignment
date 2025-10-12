@@ -36,7 +36,6 @@ env/
 .DS_Store
 Thumbs.db
 
-# experiment artifacts
-**/runs/
-*.pth
-*.npy
+# Ignore runs folders everywhere, but keep png
+**/runs/**
+!**/runs/*.png
