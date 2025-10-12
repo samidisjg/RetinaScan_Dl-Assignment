@@ -76,6 +76,18 @@ def main(args):
                    ["Train F1","Val F1"], "Macro-F1 vs Epoch",
                    "Macro-F1", os.path.join(run_dir,"f1_curve.png"), best_idx)
 
+    # Learning rate curve
+    if "lr" in df.columns:
+        plot_curve(
+            df, x="epoch",
+            ys=["lr"],
+            labels=["learning rate"],
+            title="Learning Rate vs Epoch",
+            ylabel="learning rate",
+            out_path=os.path.join(run_dir, "lr_curve.png"),
+            best_idx=None
+        )
+
     # ---- Confusion Matrices ----
     cm_path = os.path.join(run_dir, "cm_eval.npy")
     if os.path.exists(cm_path):

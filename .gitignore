@@ -24,7 +24,6 @@ env/
 !**/data/*.csv
 
 # Ignore model outputs / checkpoints / logs in any subdir
-**/runs/
 **/checkpoints/
 **/logs/
 **/report/

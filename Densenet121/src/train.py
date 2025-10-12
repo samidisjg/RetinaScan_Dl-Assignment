@@ -244,11 +244,11 @@ def main(args):
         va_loss, va_acc, va_f1, va_preds, va_gts = eval_epoch(model, val_loader, criterion, device)
         scheduler.step(epoch - 1 + 1e-8)  # align phase for WarmRestarts
 
-        print(f"  train: loss={tr_loss:.4f} acc={tr_acc:.4f} f1={tr_f1:.4f}")
-        print(f"  valid: loss={va_loss:.4f} acc={va_acc:.4f} f1={va_f1:.4f}")
-
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"  LR={current_lr:.6e}")
         _append_history_row(args.out_dir, {
             "epoch": epoch,
+            "lr": f"{current_lr:.8f}",
             "train_loss": f"{tr_loss:.6f}",
             "train_acc": f"{tr_acc:.6f}",
             "train_f1": f"{tr_f1:.6f}",
