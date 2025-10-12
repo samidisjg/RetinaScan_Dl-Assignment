@@ -1,0 +1,45 @@
+# =========================
+# RetinaScan DL – Training config
+# =========================
+
+seed: 37
+
+data:
+
+  splits_dir: "splits"
+  train_csv: "train.csv"
+  val_csv: "val.csv"
+  image_size: 448
+  batch_size: 32
+  use_weighted_sampler: true
+
+model:
+  timm_name: "convnext_tiny.in12k_ft_in1k"
+
+  num_classes: null
+
+phases:
+  # Phase-1: train classifier head only
+  freeze_epochs: 2
+
+  # Phase-2: fine-tune backbone
+  partial_unfreeze: true
+  full_unfreeze_at: null
+
+training:
+  epochs: 37
+  grad_clip: 1.0
+  label_smoothing: 0.05
+  warmup_epochs_phase2: 2
+
+optimizer:
+  lr_head_phase1: 1.0e-3
+  lr_backbone_phase2: 5.0e-5
+  lr_head_phase2: 1.0e-4
+  weight_decay_phase1: 1.0e-4
+  weight_decay_phase2: 1.0e-5
+
+output:
+  checkpoint_path: "checkpoints/convnext_tiny_second.pt"
+  history_dir: "checkpoints/history"
+  history_filename: "history_convnext_tiny_new.csv"
