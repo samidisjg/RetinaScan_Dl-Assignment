@@ -1,0 +1,62 @@
+python src/train.py \
+  --pretrained \
+  --train_csv data/train.csv --val_csv data/valid.csv \
+  --out_dir runs/d121_224_focal \
+  --epochs 15 --patience 6 --freeze_epochs 1 \
+  --batch_size 32 --img_size 224 \
+  --head_lr 1e-3 --backbone_lr 1e-4 --lr 1e-4 \
+  --weight_decay 1e-4 \
+  --focal --weighted_loss --label_smoothing 0.05
+
+python src/train.py \
+  --pretrained \
+  --train_csv data/train.csv --val_csv data/valid.csv \
+  --out_dir runs/d121_320_focal \
+  --epochs 20 --patience 6 --freeze_epochs 1 \
+  --batch_size 32 --img_size 320 \
+  --head_lr 1e-3 --backbone_lr 1e-4 --lr 1e-4 \
+  --weight_decay 1e-4 \
+  --focal --weighted_loss --label_smoothing 0.05
+
+
+
+python src/train.py \
+  --pretrained \
+  --train_csv data/train.csv --val_csv data/valid.csv \
+  --out_dir runs/d121_448_focal \
+  --epochs 15 --patience 6 --freeze_epochs 1 \
+  --batch_size 16 --img_size 448 \
+  --head_lr 1e-3 --backbone_lr 1e-4 --lr 1e-4 \
+  --weight_decay 1e-4 \
+  --focal --weighted_loss --label_smoothing 0.05
+
+
+
+python src/evaluate.py \
+  --checkpoint runs/d121_224_focal/best.pt \
+  --csv data/valid.csv \
+  --img_size 224 \
+  --batch_size 64 \
+  --tta \
+  --save_preds \
+  --save_probs
+
+python src/evaluate.py \
+  --checkpoint runs/d121_320_focal/best.pt \
+  --csv data/valid.csv \
+  --img_size 320 \
+  --batch_size 64 \
+  --tta --save_preds --save_probs
+
+python src/evaluate.py \
+  --checkpoint runs/d121_448_focal/best.pt \
+  --csv data/valid.csv \
+  --img_size 448 \
+  --batch_size 32 \
+  --tta \
+  --save_preds \
+  --save_probs
+
+python src/plot_metrics.py --run_dir runs/d121_224_focal
+python src/plot_metrics.py --run_dir runs/d121_320_focal
+python src/plot_metrics.py --run_dir runs/d121_448_focal
