@@ -8,43 +8,112 @@ OUT_DIR = "training_plots"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 df = pd.read_csv(CSV_PATH).reset_index(drop=True)
-
-# Running epoch index for x-axis
 df["epoch_idx"] = np.arange(1, len(df) + 1)
 
-def save_line(x, y, xlabel, ylabel, title, fname):
-    plt.figure()
-    plt.plot(x, y)
-    plt.xlabel(xlabel); plt.ylabel(ylabel); plt.title(title)
-    plt.grid(True, linestyle="--", linewidth=0.5)
+def save_plot(fig, name):
     plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, fname), dpi=150)
-    plt.close()
+    fig.savefig(os.path.join(OUT_DIR, name), dpi=150)
+    plt.close(fig)
 
-# Core curves
-save_line(df["epoch_idx"], df["train_loss"], "Epoch", "Train Loss", "Train Loss vs Epoch", "train_loss.png")
-save_line(df["epoch_idx"], df["val_loss"],   "Epoch", "Val Loss",   "Val Loss vs Epoch",   "val_loss.png")
-save_line(df["epoch_idx"], df["train_acc"],  "Epoch", "Train Accuracy", "Train Accuracy vs Epoch", "train_acc.png")
-save_line(df["epoch_idx"], df["val_acc"],    "Epoch", "Val Accuracy",   "Val Accuracy vs Epoch",   "val_acc.png")
-save_line(df["epoch_idx"], df["balanced_acc"], "Epoch", "Balanced Accuracy", "Balanced Accuracy vs Epoch", "balanced_acc.png")
-save_line(df["epoch_idx"], df["macro_f1"],     "Epoch", "Macro F1",        "Macro F1 vs Epoch",        "macro_f1.png")
-save_line(df["epoch_idx"], df["lr_0"], "Epoch", "Learning Rate (group 0)", "LR Group 0 vs Epoch", "lr_group0.png")
-save_line(df["epoch_idx"], df.get("lr_1", df["lr_0"]), "Epoch", "Learning Rate (group 1)", "LR Group 1 vs Epoch", "lr_group1.png")
-save_line(df["epoch_idx"], df["epoch_seconds"], "Epoch", "Seconds", "Epoch Time vs Epoch", "epoch_time.png")
+# ------------------------
+# Combined plots (train + val)
+# ------------------------
 
-# Per-class recall / F1 curves (if present)
+# 1️⃣ Loss: Train vs Validation
+fig, ax = plt.subplots()
+ax.plot(df["epoch_idx"], df["train_loss"], label="Train Loss")
+ax.plot(df["epoch_idx"], df["val_loss"], label="Validation Loss")
+ax.set_xlabel("Epoch")
+ax.set_ylabel("Loss")
+ax.set_title("Train vs Validation Loss")
+ax.grid(True, linestyle="--", linewidth=0.5)
+ax.legend()
+save_plot(fig, "loss_combined.png")
+
+# 2️⃣ Accuracy: Train vs Validation
+fig, ax = plt.subplots()
+ax.plot(df["epoch_idx"], df["train_acc"], label="Train Accuracy")
+ax.plot(df["epoch_idx"], df["val_acc"], label="Validation Accuracy")
+ax.set_xlabel("Epoch")
+ax.set_ylabel("Accuracy")
+ax.set_title("Train vs Validation Accuracy")
+ax.grid(True, linestyle="--", linewidth=0.5)
+ax.legend()
+save_plot(fig, "accuracy_combined.png")
+
+# 3️⃣ Balanced Accuracy & Macro F1 together
+fig, ax = plt.subplots()
+ax.plot(df["epoch_idx"], df["balanced_acc"], label="Balanced Accuracy")
+ax.plot(df["epoch_idx"], df["macro_f1"], label="Macro F1-score")
+ax.set_xlabel("Epoch")
+ax.set_ylabel("Score")
+ax.set_title("Balanced Accuracy and Macro F1 vs Epoch")
+ax.grid(True, linestyle="--", linewidth=0.5)
+ax.legend()
+save_plot(fig, "balanced_acc_macro_f1.png")
+
+# 4️⃣ Learning rates for both groups
+fig, ax = plt.subplots()
+ax.plot(df["epoch_idx"], df["lr_0"], label="LR Group 0")
+if "lr_1" in df.columns:
+    ax.plot(df["epoch_idx"], df["lr_1"], label="LR Group 1")
+ax.set_xlabel("Epoch")
+ax.set_ylabel("Learning Rate")
+ax.set_title("Learning Rates vs Epoch")
+ax.grid(True, linestyle="--", linewidth=0.5)
+ax.legend()
+save_plot(fig, "learning_rates_combined.png")
+
+# 5️⃣ Per-class Recall in one plot
 recall_cols = [c for c in df.columns if c.startswith("recall_")]
-f1_cols     = [c for c in df.columns if c.startswith("f1_")]
-
 if recall_cols:
+    fig, ax = plt.subplots()
     for c in recall_cols:
-        save_line(df["epoch_idx"], df[c], "Epoch", "Recall", f"{c} vs Epoch", f"{c}.png")
+        ax.plot(df["epoch_idx"], df[c], label=c)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Recall")
+    ax.set_title("Per-class Recall vs Epoch")
+    ax.grid(True, linestyle="--", linewidth=0.5)
+    ax.legend()
+    save_plot(fig, "recall_all_classes.png")
 
+# 6️⃣ Per-class F1 in one plot
+f1_cols = [c for c in df.columns if c.startswith("f1_")]
 if f1_cols:
+    fig, ax = plt.subplots()
     for c in f1_cols:
-        save_line(df["epoch_idx"], df[c], "Epoch", "F1-score", f"{c} vs Epoch", f"{c}.png")
+        ax.plot(df["epoch_idx"], df[c], label=c)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("F1-score")
+    ax.set_title("Per-class F1 vs Epoch")
+    ax.grid(True, linestyle="--", linewidth=0.5)
+    ax.legend()
+    save_plot(fig, "f1_all_classes.png")
 
-print(f"Saved plots to: {OUT_DIR}/")
+# 7️⃣ Summary grid (optional)
+fig, axs = plt.subplots(2, 2, figsize=(10, 8))
+axs = axs.ravel()
+axs[0].plot(df["epoch_idx"], df["train_loss"], label="Train Loss")
+axs[0].plot(df["epoch_idx"], df["val_loss"], label="Val Loss")
+axs[0].set_title("Loss"); axs[0].legend(); axs[0].grid(True, linestyle="--")
 
+axs[1].plot(df["epoch_idx"], df["train_acc"], label="Train Acc")
+axs[1].plot(df["epoch_idx"], df["val_acc"], label="Val Acc")
+axs[1].set_title("Accuracy"); axs[1].legend(); axs[1].grid(True, linestyle="--")
 
+axs[2].plot(df["epoch_idx"], df["balanced_acc"], label="Balanced Acc")
+axs[2].plot(df["epoch_idx"], df["macro_f1"], label="Macro F1")
+axs[2].set_title("Balanced Acc & F1"); axs[2].legend(); axs[2].grid(True, linestyle="--")
 
+axs[3].plot(df["epoch_idx"], df["lr_0"], label="LR Group 0")
+if "lr_1" in df.columns:
+    axs[3].plot(df["epoch_idx"], df["lr_1"], label="LR Group 1")
+axs[3].set_title("Learning Rates"); axs[3].legend(); axs[3].grid(True, linestyle="--")
+
+for ax in axs:
+    ax.set_xlabel("Epoch")
+
+fig.suptitle("Training Overview", fontsize=14)
+save_plot(fig, "overview_grid.png")
+
+print(f"✅ Combined graphs saved to: {OUT_DIR}/")
