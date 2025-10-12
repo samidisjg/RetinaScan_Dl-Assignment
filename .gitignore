@@ -37,9 +37,8 @@ env/
 Thumbs.db
 
 # experiment artifacts
-runs/
-*.pt
+**/runs/
 *.pth
 *.npy
-*.png
 *.csv
+*.txt
