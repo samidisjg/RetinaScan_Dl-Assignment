@@ -35,3 +35,11 @@ env/
 # ======================
 .DS_Store
 Thumbs.db
+
+# experiment artifacts
+runs/
+*.pt
+*.pth
+*.npy
+*.png
+*.csv
