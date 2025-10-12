@@ -36,7 +36,9 @@ env/
 .DS_Store
 Thumbs.db
 
+# ======================
 # Ignore runs folders everywhere, but keep png
+# ======================
 **/runs/**
 !**/runs/*.png
 !**/runs/*.csv
