@@ -1,19 +1,27 @@
-import os, csv, time, torch, timm
+import os, csv, time, argparse, random
+import pandas as pd
+import numpy as np
+import torch, timm
+from yaml import safe_load
 from pathlib import Path
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch import nn
 from tqdm import tqdm
+from sklearn.metrics import (
+    balanced_accuracy_score, f1_score,
+    precision_recall_fscore_support, classification_report
+)
 from .dataset import CSVDataset
-from sklearn.metrics import balanced_accuracy_score, f1_score, precision_recall_fscore_support, classification_report
-import pandas as pd
-import numpy as np
 
+# -------------------- Device --------------------
 DEVICE = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
 
-ROOT = Path(__file__).resolve().parents[1]
-SPLITS = ROOT / "splits"
-
-print(SPLITS)
+# -------------------- Repro --------------------
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 # -------------------- Imbalance: Weighted Sampler --------------------
 def _build_weighted_sampler(train_csv, classes):
@@ -81,27 +89,65 @@ def build_optimizer(model, lr_backbone, lr_head, weight_decay, train_head_only=F
 def current_lrs(optimizer):
     return [g["lr"] for g in optimizer.param_groups]
 
+# -------------------- Eval helper --------------------
+@torch.no_grad()
+def evaluate(model, dl, loss_fn, C: int):
+    model.eval()
+    vtotal, vcorrect, vloss = 0, 0, 0.0
+    all_pred, all_true = [], []
+    for xb, yb in tqdm(dl, desc="Eval"):
+        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+        logits = model(xb)
+        loss = loss_fn(logits, yb)
+        vloss += loss.item() * xb.size(0)
+        pred = logits.argmax(1)
+        vtotal += yb.size(0)
+        vcorrect += (pred == yb).sum().item()
+        all_pred.extend(pred.cpu().tolist())
+        all_true.extend(yb.cpu().tolist())
+
+    val_acc = vcorrect / max(1, vtotal)
+    val_loss = vloss / max(1, vtotal)
+    bal_acc = balanced_accuracy_score(all_true, all_pred) if all_true else 0.0
+    prec, rec, f1, sup = precision_recall_fscore_support(
+        all_true, all_pred, labels=list(range(C)), zero_division=0
+    )
+    macro_f1 = f1_score(all_true, all_pred, average='macro') if all_true else 0.0
+    return {
+        "val_acc": val_acc, "val_loss": val_loss, "bal_acc": bal_acc,
+        "prec": prec, "rec": rec, "f1": f1, "macro_f1": macro_f1,
+        "all_true": all_true, "all_pred": all_pred,
+    }
+
 # -------------------- Train / Eval --------------------
-def run(train_csv=SPLITS / "train.csv",
-        val_csv=SPLITS / "val.csv",
-        out="checkpoints/convnext_tiny_fourth.pt",
-        size=448, batch_size=32, epochs=37,
-        # Phase controls
-        freeze_epochs=2,                 # Phase-1 (head only)
-        partial_unfreeze=True,           # unfreeze stages 3-4 + head first
-        full_unfreeze_at=None,           # e.g., 8 => after 8 epochs of phase-2, unfreeze all; None to skip
-        # LRs & WD
-        lr_head_phase1=1e-3,
-        lr_backbone_phase2=5e-5,
-        lr_head_phase2=1e-4,
-        weight_decay_phase1=1e-4,
-        weight_decay_phase2=1e-5,
-        # Warmup
-        warmup_epochs_phase2=2,
-        # Other
-        grad_clip=1.0,
-        label_smoothing=0.05,
-        use_weighted_sampler=True):
+def run(
+    train_csv,
+    val_csv,
+    out,
+    size=448,
+    batch_size=32,
+    epochs=37,
+    # Phase controls
+    freeze_epochs=2,
+    partial_unfreeze=True,
+    full_unfreeze_at=None,
+    # LRs & WD
+    lr_head_phase1=1e-3,
+    lr_backbone_phase2=5e-5,
+    lr_head_phase2=1e-4,
+    weight_decay_phase1=1e-4,
+    weight_decay_phase2=1e-5,
+    # Warmup
+    warmup_epochs_phase2=2,
+    # Other
+    grad_clip=1.0,
+    label_smoothing=0.05,
+    use_weighted_sampler=True,
+    # Model
+    model_name="convnext_tiny.in12k_ft_in1k",
+    # History output (optional override)
+    history_path: str | None = None,
+):
 
     # Classes
     classes = sorted(pd.read_csv(train_csv)["label"].unique().tolist())
@@ -123,8 +169,7 @@ def run(train_csv=SPLITS / "train.csv",
                           num_workers=0, pin_memory=True)
 
     # Model
-    model = timm.create_model("convnext_tiny.in12k_ft_in1k",
-                              pretrained=True, num_classes=C)
+    model = timm.create_model(model_name, pretrained=True, num_classes=C)
     model.to(DEVICE)
 
     # Loss (label smoothing helps stability)
@@ -133,15 +178,19 @@ def run(train_csv=SPLITS / "train.csv",
     # ---- history logging (CSV) ----
     best_score = -1.0  # macro-F1
     history = []
-    history_path = os.path.join(os.path.dirname(out), "history","history_convnext_tiny_fourth.csv")
-    print("os path dirname :",os.path.dirname(out))
-    print("history path : ", history_path)
+
+    if history_path is None:
+        history_path = os.path.join(os.path.dirname(out), "history", "history_convnext_tiny_new.csv")
     os.makedirs(os.path.dirname(out), exist_ok=True)
+    os.makedirs(os.path.dirname(history_path), exist_ok=True)
+
+    print("Checkpoint path:", out)
+    print("History path   :", history_path)
 
     # dynamic headers for per-class recall/f1
     per_class_headers = [f"recall_{i}" for i in range(C)] + [f"f1_{i}" for i in range(C)]
 
-    def log_epoch(phase, epoch, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1, lrs, per_class_vals):
+    def log_epoch(phase, epoch, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1, lrs, per_class_vals, epoch_seconds):
         row = {
             "phase": phase, "epoch": epoch,
             "train_loss": train_loss, "train_acc": train_acc,
@@ -149,12 +198,12 @@ def run(train_csv=SPLITS / "train.csv",
             "balanced_acc": bal_acc, "macro_f1": macro_f1,
             "lr_0": lrs[0] if len(lrs) > 0 else 0.0,
             "lr_1": lrs[1] if len(lrs) > 1 else 0.0,
-            "epoch_seconds": per_class_vals.get("epoch_seconds", 0.0),
+            "epoch_seconds": epoch_seconds,
         }
         # add per-class recall/F1
         for i in range(C):
-            row[f"recall_{i}"] = per_class_vals["recall"][i]
-            row[f"f1_{i}"] = per_class_vals["f1"][i]
+            row[f"recall_{i}"] = float(per_class_vals["recall"][i])
+            row[f"f1_{i}"] = float(per_class_vals["f1"][i])
         history.append(row)
 
     # -------------------- Phase-1: train head only --------------------
@@ -189,42 +238,28 @@ def run(train_csv=SPLITS / "train.csv",
                 correct += (pred == yb).sum().item()
 
             # Validate
-            model.eval()
-            vtotal, vcorrect, vloss = 0, 0, 0.0
-            all_pred, all_true = [], []
-            with torch.no_grad():
-                for xb, yb in tqdm(val_dl, desc="Val"):
-                    xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                    logits = model(xb)
-                    loss = loss_fn(logits, yb)
-                    vloss += loss.item() * xb.size(0)
-                    pred = logits.argmax(1)
-                    vtotal += yb.size(0)
-                    vcorrect += (pred == yb).sum().item()
-                    all_pred.extend(pred.cpu().tolist())
-                    all_true.extend(yb.cpu().tolist())
-
+            eval_out = evaluate(model, val_dl, loss_fn, C)
             train_acc = correct / max(1, total)
             train_loss = running_loss / max(1, total)
-            val_acc = vcorrect / max(1, vtotal)
-            val_loss = vloss / max(1, vtotal)
-            bal_acc = balanced_accuracy_score(all_true, all_pred) if all_true else 0.0
-            # per-class metrics
-            prec, rec, f1, sup = precision_recall_fscore_support(
-                all_true, all_pred, labels=list(range(C)), zero_division=0
-            )
-            macro_f1 = f1_score(all_true, all_pred, average='macro') if all_true else 0.0
 
             print(f"[Phase-1] Epoch {ep}: train_loss={train_loss:.4f} acc={train_acc:.3f} | "
-                  f"val_loss={val_loss:.4f} acc={val_acc:.3f} bal_acc={bal_acc:.3f} macroF1={macro_f1:.3f} | lrs={current_lrs(opt)}")
+                  f"val_loss={eval_out['val_loss']:.4f} acc={eval_out['val_acc']:.3f} "
+                  f"bal_acc={eval_out['bal_acc']:.3f} macroF1={eval_out['macro_f1']:.3f} | lrs={current_lrs(opt)}")
 
-            if macro_f1 > best_score:
-                best_score = macro_f1
+            if eval_out["macro_f1"] > best_score:
+                best_score = eval_out["macro_f1"]
                 torch.save({"model": model.state_dict(), "classes": classes}, out)
-                print(f"✓ Saved (macroF1={macro_f1:.3f}):", out)
+                print(f"✓ Saved (macroF1={best_score:.3f}):", out)
 
-            log_epoch("Phase-1", ep, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1,
-                      current_lrs(opt), {"recall": rec.tolist(), "f1": f1.tolist(), "epoch_seconds": time.time()-t0})
+            log_epoch(
+                "Phase-1", ep,
+                train_loss, train_acc,
+                eval_out["val_loss"], eval_out["val_acc"],
+                eval_out["bal_acc"], eval_out["macro_f1"],
+                current_lrs(opt),
+                {"recall": eval_out["rec"], "f1": eval_out["f1"]},
+                time.time() - t0
+            )
             sched.step()
 
     # -------------------- Phase-2: fine-tune (partial → optional full) --------------------
@@ -287,48 +322,36 @@ def run(train_csv=SPLITS / "train.csv",
                 correct += (pred == yb).sum().item()
 
             # Validate
-            model.eval()
-            vtotal, vcorrect, vloss = 0, 0, 0.0
-            all_pred, all_true = [], []
-            with torch.no_grad():
-                for xb, yb in tqdm(val_dl, desc="Val"):
-                    xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                    logits = model(xb)
-                    loss = loss_fn(logits, yb)
-                    vloss += loss.item() * xb.size(0)
-                    pred = logits.argmax(1)
-                    vtotal += yb.size(0)
-                    vcorrect += (pred == yb).sum().item()
-                    all_pred.extend(pred.cpu().tolist())
-                    all_true.extend(yb.cpu().tolist())
-
+            eval_out = evaluate(model, val_dl, loss_fn, C)
             train_acc = correct / max(1, total)
             train_loss = running_loss / max(1, total)
-            val_acc = vcorrect / max(1, vtotal)
-            val_loss = vloss / max(1, vtotal)
-            bal_acc = balanced_accuracy_score(all_true, all_pred) if all_true else 0.0
-            prec, rec, f1, sup = precision_recall_fscore_support(
-                all_true, all_pred, labels=list(range(C)), zero_division=0
-            )
-            macro_f1 = f1_score(all_true, all_pred, average='macro') if all_true else 0.0
 
             print(f"[Phase-2] Epoch {ep}: train_loss={train_loss:.4f} acc={train_acc:.3f} | "
-                  f"val_loss={val_loss:.4f} acc={val_acc:.3f} bal_acc={bal_acc:.3f} macroF1={macro_f1:.3f} | lrs={current_lrs(opt)}")
+                  f"val_loss={eval_out['val_loss']:.4f} acc={eval_out['val_acc']:.3f} "
+                  f"bal_acc={eval_out['bal_acc']:.3f} macroF1={eval_out['macro_f1']:.3f} | lrs={current_lrs(opt)}")
 
-            if macro_f1 > best_score:
-                best_score = macro_f1
+            if eval_out["macro_f1"] > best_score:
+                best_score = eval_out["macro_f1"]
                 torch.save({"model": model.state_dict(), "classes": classes}, out)
-                print(f"✓ Saved (macroF1={macro_f1:.3f}):", out)
+                print(f"✓ Saved (macroF1={best_score:.3f}):", out)
 
-            log_epoch("Phase-2", ep, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1,
-                      current_lrs(opt), {"recall": rec.tolist(), "f1": f1.tolist(), "epoch_seconds": time.time()-t0})
+            log_epoch(
+                "Phase-2", ep,
+                train_loss, train_acc,
+                eval_out["val_loss"], eval_out["val_acc"],
+                eval_out["bal_acc"], eval_out["macro_f1"],
+                current_lrs(opt),
+                {"recall": eval_out["rec"], "f1": eval_out["f1"]},
+                time.time() - t0
+            )
             sched.step()
 
-    # --------- Final per-class report on validation set ---------
+    # --------- Final per-class report on validation set (fresh pass) ---------
+    final_eval = evaluate(model, val_dl, loss_fn, C)
     label_ids = list(range(C))
     names = [str(c) for c in classes]
     print(classification_report(
-        all_true, all_pred,
+        final_eval["all_true"], final_eval["all_pred"],
         labels=label_ids,
         target_names=names,
         zero_division=0,
@@ -345,11 +368,68 @@ def run(train_csv=SPLITS / "train.csv",
             writer = csv.DictWriter(f, fieldnames=headers)
             writer.writeheader()
             for row in history:
-                # fill missing per-class fields if any
                 for h in per_class_headers:
                     row.setdefault(h, 0.0)
-                writer.writerows([row])
+                writer.writerow(row)
         print("Saved training history to:", history_path)
 
+# -------------------- Main: YAML loader --------------------
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/train_convnext_tiny.yaml", help="Path to YAML config")
+    args = parser.parse_args()
+
+    with open(args.config, "r") as f:
+        cfg = safe_load(f)
+
+    seed = cfg.get("seed", 42)
+    set_seed(seed)
+
+    # Resolve paths from YAML
+    splits_dir = Path(cfg["data"]["splits_dir"])
+    train_csv = splits_dir / cfg["data"]["train_csv"]
+    val_csv   = splits_dir / cfg["data"]["val_csv"]
+
+    # Output paths
+    ckpt_path       = cfg["output"]["checkpoint_path"]
+    history_dir     = cfg["output"]["history_dir"]
+    history_filename= cfg["output"]["history_filename"]
+    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+    os.makedirs(history_dir, exist_ok=True)
+    history_path = str(Path(history_dir) / history_filename)
+
+    run(
+        train_csv=str(train_csv),
+        val_csv=str(val_csv),
+        out=ckpt_path,
+        size=cfg["data"]["image_size"],
+        batch_size=cfg["data"]["batch_size"],
+        epochs=cfg["training"]["epochs"],
+
+        # Phase controls
+        freeze_epochs=cfg["phases"]["freeze_epochs"],
+        partial_unfreeze=cfg["phases"]["partial_unfreeze"],
+        full_unfreeze_at=cfg["phases"]["full_unfreeze_at"],
+
+        # LRs & WD
+        lr_head_phase1=cfg["optimizer"]["lr_head_phase1"],
+        lr_backbone_phase2=cfg["optimizer"]["lr_backbone_phase2"],
+        lr_head_phase2=cfg["optimizer"]["lr_head_phase2"],
+        weight_decay_phase1=cfg["optimizer"]["weight_decay_phase1"],
+        weight_decay_phase2=cfg["optimizer"]["weight_decay_phase2"],
+
+        # Warmup & misc
+        warmup_epochs_phase2=cfg["training"]["warmup_epochs_phase2"],
+        grad_clip=cfg["training"]["grad_clip"],
+        label_smoothing=cfg["training"]["label_smoothing"],
+        use_weighted_sampler=cfg["data"]["use_weighted_sampler"],
+
+        # Model
+        model_name=cfg["model"]["timm_name"],
+
+        # History file
+        history_path=history_path,
+    )
+
+
+
