@@ -1,10 +1,10 @@
-import os, csv, torch, timm
+import os, csv, time, torch, timm
 from pathlib import Path
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch import nn
 from tqdm import tqdm
 from .dataset import CSVDataset
-from sklearn.metrics import classification_report, balanced_accuracy_score, f1_score
+from sklearn.metrics import balanced_accuracy_score, f1_score, precision_recall_fscore_support, classification_report
 import pandas as pd
 import numpy as np
 
@@ -52,7 +52,6 @@ def unfreeze_stages_3_4_and_head(model):
     # ConvNeXt in timm: model.stages[0..3], model.head
     for p in model.parameters():
         p.requires_grad = False
-    # unfreeze deeper stages + head
     for p in model.stages[2].parameters():  # stage 3
         p.requires_grad = True
     for p in model.stages[3].parameters():  # stage 4
@@ -85,8 +84,8 @@ def current_lrs(optimizer):
 # -------------------- Train / Eval --------------------
 def run(train_csv=SPLITS / "train.csv",
         val_csv=SPLITS / "val.csv",
-        out="checkpoints/convnext_tiny_second.pt",
-        size=224, batch_size=32, epochs=37,
+        out="checkpoints/convnext_tiny_fourth.pt",
+        size=448, batch_size=32, epochs=37,
         # Phase controls
         freeze_epochs=2,                 # Phase-1 (head only)
         partial_unfreeze=True,           # unfreeze stages 3-4 + head first
@@ -106,6 +105,7 @@ def run(train_csv=SPLITS / "train.csv",
 
     # Classes
     classes = sorted(pd.read_csv(train_csv)["label"].unique().tolist())
+    C = len(classes)
 
     # Datasets / Loaders
     train_ds = CSVDataset(train_csv, classes=classes, train=True,  size=size)
@@ -124,27 +124,38 @@ def run(train_csv=SPLITS / "train.csv",
 
     # Model
     model = timm.create_model("convnext_tiny.in12k_ft_in1k",
-                              pretrained=True, num_classes=len(classes))
+                              pretrained=True, num_classes=C)
     model.to(DEVICE)
 
-    # Loss
+    # Loss (label smoothing helps stability)
     loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     # ---- history logging (CSV) ----
     best_score = -1.0  # macro-F1
     history = []
-    history_path = os.path.join(os.path.dirname(out), "history/history_convnext_tiny.csv")
+    history_path = os.path.join(os.path.dirname(out), "history","history_convnext_tiny_fourth.csv")
+    print("os path dirname :",os.path.dirname(out))
+    print("history path : ", history_path)
     os.makedirs(os.path.dirname(out), exist_ok=True)
 
-    def log_epoch(phase, epoch, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1, lrs):
-        history.append({
+    # dynamic headers for per-class recall/f1
+    per_class_headers = [f"recall_{i}" for i in range(C)] + [f"f1_{i}" for i in range(C)]
+
+    def log_epoch(phase, epoch, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1, lrs, per_class_vals):
+        row = {
             "phase": phase, "epoch": epoch,
             "train_loss": train_loss, "train_acc": train_acc,
             "val_loss": val_loss, "val_acc": val_acc,
             "balanced_acc": bal_acc, "macro_f1": macro_f1,
             "lr_0": lrs[0] if len(lrs) > 0 else 0.0,
             "lr_1": lrs[1] if len(lrs) > 1 else 0.0,
-        })
+            "epoch_seconds": per_class_vals.get("epoch_seconds", 0.0),
+        }
+        # add per-class recall/F1
+        for i in range(C):
+            row[f"recall_{i}"] = per_class_vals["recall"][i]
+            row[f"f1_{i}"] = per_class_vals["f1"][i]
+        history.append(row)
 
     # -------------------- Phase-1: train head only --------------------
     phase1_epochs = max(0, min(freeze_epochs, epochs))
@@ -158,6 +169,7 @@ def run(train_csv=SPLITS / "train.csv",
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=phase1_epochs)
 
         for ep in range(1, phase1_epochs + 1):
+            t0 = time.time()
             # Train
             model.train()
             total, correct, running_loss = 0, 0, 0.0
@@ -197,6 +209,10 @@ def run(train_csv=SPLITS / "train.csv",
             val_acc = vcorrect / max(1, vtotal)
             val_loss = vloss / max(1, vtotal)
             bal_acc = balanced_accuracy_score(all_true, all_pred) if all_true else 0.0
+            # per-class metrics
+            prec, rec, f1, sup = precision_recall_fscore_support(
+                all_true, all_pred, labels=list(range(C)), zero_division=0
+            )
             macro_f1 = f1_score(all_true, all_pred, average='macro') if all_true else 0.0
 
             print(f"[Phase-1] Epoch {ep}: train_loss={train_loss:.4f} acc={train_acc:.3f} | "
@@ -207,7 +223,8 @@ def run(train_csv=SPLITS / "train.csv",
                 torch.save({"model": model.state_dict(), "classes": classes}, out)
                 print(f"✓ Saved (macroF1={macro_f1:.3f}):", out)
 
-            log_epoch("Phase-1", ep, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1, current_lrs(opt))
+            log_epoch("Phase-1", ep, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1,
+                      current_lrs(opt), {"recall": rec.tolist(), "f1": f1.tolist(), "epoch_seconds": time.time()-t0})
             sched.step()
 
     # -------------------- Phase-2: fine-tune (partial → optional full) --------------------
@@ -225,18 +242,16 @@ def run(train_csv=SPLITS / "train.csv",
                               train_head_only=False)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=phase2_epochs)
 
-        # Warmup: start at 0.1x lr then linearly ramp to base over warmup_epochs
+        # Warmup
         warmup_epochs = min(warmup_epochs_phase2, phase2_epochs)
         bb_base, hd_base = lr_backbone_phase2, lr_head_phase2
         for g in opt.param_groups:
             if "params" in g and len(g["params"]) > 0:
-                if abs(g["lr"] - bb_base) < 1e-12:
-                    g["lr"] = bb_base * 0.1
-                elif abs(g["lr"] - hd_base) < 1e-12:
-                    g["lr"] = hd_base * 0.1
+                if abs(g["lr"] - bb_base) < 1e-12: g["lr"] = bb_base * 0.1
+                elif abs(g["lr"] - hd_base) < 1e-12: g["lr"] = hd_base * 0.1
 
         for ep in range(1, phase2_epochs + 1):
-            # optional switch to full unfreeze after some epochs
+            t0 = time.time()
             if full_unfreeze_at is not None and ep == full_unfreeze_at:
                 unfreeze_all(model)
                 opt = build_optimizer(model,
@@ -245,7 +260,6 @@ def run(train_csv=SPLITS / "train.csv",
                                       weight_decay=weight_decay_phase2,
                                       train_head_only=False)
 
-            # Warmup step
             if ep <= warmup_epochs:
                 scale = 0.1 + 0.9 * (ep / max(1, warmup_epochs))
                 for g in opt.param_groups:
@@ -293,6 +307,9 @@ def run(train_csv=SPLITS / "train.csv",
             val_acc = vcorrect / max(1, vtotal)
             val_loss = vloss / max(1, vtotal)
             bal_acc = balanced_accuracy_score(all_true, all_pred) if all_true else 0.0
+            prec, rec, f1, sup = precision_recall_fscore_support(
+                all_true, all_pred, labels=list(range(C)), zero_division=0
+            )
             macro_f1 = f1_score(all_true, all_pred, average='macro') if all_true else 0.0
 
             print(f"[Phase-2] Epoch {ep}: train_loss={train_loss:.4f} acc={train_acc:.3f} | "
@@ -303,11 +320,12 @@ def run(train_csv=SPLITS / "train.csv",
                 torch.save({"model": model.state_dict(), "classes": classes}, out)
                 print(f"✓ Saved (macroF1={macro_f1:.3f}):", out)
 
-            log_epoch("Phase-2", ep, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1, current_lrs(opt))
+            log_epoch("Phase-2", ep, train_loss, train_acc, val_loss, val_acc, bal_acc, macro_f1,
+                      current_lrs(opt), {"recall": rec.tolist(), "f1": f1.tolist(), "epoch_seconds": time.time()-t0})
             sched.step()
 
     # --------- Final per-class report on validation set ---------
-    label_ids = list(range(len(classes)))
+    label_ids = list(range(C))
     names = [str(c) for c in classes]
     print(classification_report(
         all_true, all_pred,
@@ -319,10 +337,18 @@ def run(train_csv=SPLITS / "train.csv",
 
     # ---- write history CSV ----
     if len(history) > 0:
+        headers = list(history[0].keys())
+        # ensure per-class headers are present and ordered
+        for h in per_class_headers:
+            if h not in headers: headers.append(h)
         with open(history_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+            writer = csv.DictWriter(f, fieldnames=headers)
             writer.writeheader()
-            writer.writerows(history)
+            for row in history:
+                # fill missing per-class fields if any
+                for h in per_class_headers:
+                    row.setdefault(h, 0.0)
+                writer.writerows([row])
         print("Saved training history to:", history_path)
 
 if __name__ == "__main__":
