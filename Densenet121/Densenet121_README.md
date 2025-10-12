@@ -14,6 +14,16 @@ In this project, **DenseNet-121 pretrained on ImageNet** was fine-tuned on the r
 
 ---
 
+## 🧩 Model Architecture
+
+The following diagram shows the **DenseNet-121 model architecture** used for retinal disease classification:
+
+![DenseNet Architecture](ArchitectureDiagram.png)
+
+Each *Dense Block* consists of multiple convolutional layers that are densely connected to encourage feature reuse, followed by *transition layers* that perform convolution and pooling to reduce dimensions before classification.
+
+---
+
 ## 📊 Dataset Details
 
 **Dataset:** [Retinal Disease Detection (Kaggle)](https://www.kaggle.com/datasets/mohamedabdalkader/retinal-disease-detection)
@@ -87,15 +97,7 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 Example command used for best-performing model:
 
 ```bash
-python src/train.py \
-  --pretrained \
-  --train_csv data/train.csv --val_csv data/valid.csv \
-  --out_dir runs/d121_448_focal \
-  --epochs 20 --patience 6 --freeze_epochs 1 \
-  --batch_size 16 --img_size 448 \
-  --head_lr 1e-3 --backbone_lr 1e-4 --lr 1e-4 \
-  --weight_decay 1e-4 \
-  --focal --weighted_loss --label_smoothing 0.05
+python src/train.py   --pretrained   --train_csv data/train.csv --val_csv data/valid.csv   --out_dir runs/d121_448_focal   --epochs 20 --patience 6 --freeze_epochs 1   --batch_size 16 --img_size 448   --head_lr 1e-3 --backbone_lr 1e-4 --lr 1e-4   --weight_decay 1e-4   --focal --weighted_loss --label_smoothing 0.05
 ```
 
 ### 🔧 Key Techniques
@@ -113,14 +115,7 @@ python src/train.py \
 After training, evaluate the model using:
 
 ```bash
-python src/evaluate.py \
-  --checkpoint runs/d121_448_focal/best.pt \
-  --csv data/test.csv \
-  --img_size 448 \
-  --batch_size 64 \
-  --tta \
-  --save_preds \
-  --save_probs
+python src/evaluate.py   --checkpoint runs/d121_448_focal/best.pt   --csv data/test.csv   --img_size 448   --batch_size 64   --tta   --save_preds   --save_probs
 ```
 
 Outputs:
