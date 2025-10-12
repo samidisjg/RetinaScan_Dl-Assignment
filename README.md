@@ -46,7 +46,7 @@ Provides an AI‑assisted screening tool to support ophthalmologists in early DR
 
 ## 👥 Team — Group 11(Deep Learning Module SE4050)
 - IT22607232 — **Gamage S S J**  
-- IT22577160 — **Nimesh R H R**  
+- IT22577160 — **Nimes R H R**  
 - IT22602978 — **Damnidu T W T**  
 - IT22603418 — **P Pradicksha**  
 
