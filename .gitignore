@@ -39,3 +39,5 @@ Thumbs.db
 # Ignore runs folders everywhere, but keep png
 **/runs/**
 !**/runs/*.png
+!**/runs/*.csv
+!**/runs/*.txt
