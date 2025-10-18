@@ -60,3 +60,29 @@ python src/evaluate.py \
 python src/plot_metrics.py --run_dir runs/d121_224_focal
 python src/plot_metrics.py --run_dir runs/d121_320_focal
 python src/plot_metrics.py --run_dir runs/d121_448_focal
+
+
+python - <<'PY'
+import pandas as pd
+from sklearn.metrics import roc_auc_score
+
+# --- change these if needed ---
+csv_path = "runs/d121_448_focal/preds_eval.csv"
+edema_class_id = 4            # <-- set to the class index that means "edema"
+# ------------------------------
+
+df = pd.read_csv(csv_path)
+
+# Binary ground truth: 1 if true class == edema, else 0
+y_true = (df["true_label"] == edema_class_id).astype(int).values
+
+# Model score: probability for the edema class
+y_score = df[f"prob_class_{edema_class_id}"].values
+
+# Safety: need both positive and negative samples to compute ROC-AUC
+if y_true.sum() == 0 or y_true.sum() == len(y_true):
+    print("Cannot compute ROC-AUC: y_true has only one class (all 0s or all 1s).")
+else:
+    auc = roc_auc_score(y_true, y_score)
+    print(f"Edema (class {edema_class_id}) ROC-AUC: {auc:.4f}")
+PY
