@@ -5,38 +5,52 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 
+# Importing project modules
 from dataset import RetinaDataset
 from transforms import build_transforms
 from model_densenet121 import build_densenet121
 from utils import load_json, get_device
 
-@torch.no_grad()
+
+@torch.no_grad()  # Disable gradient computation (faster + memory efficient for evaluation)
 def main(args):
+    # 1️⃣ Select device (CPU / GPU / Apple MPS)
     device = get_device()
+
+    # 2️⃣ Load class mapping dictionary (e.g., {"0":0, "1":1, ...})
     class_to_idx = load_json(args.class_map)
-    idx_to_class = {v:k for k,v in class_to_idx.items()}
+    idx_to_class = {v: k for k, v in class_to_idx.items()}  # Reverse mapping for readable labels
     num_classes = len(idx_to_class)
 
+    # 3️⃣ Initialize dataset and dataloader for test set
     ds = RetinaDataset(args.test_csv, tfm=build_transforms(args.img_size, is_train=False))
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
+    # 4️⃣ Load trained DenseNet-121 model
     model = build_densenet121(num_classes, pretrained=False).to(device)
     model.load_state_dict(torch.load(args.ckpt, map_location=device))
-    model.eval()
+    model.eval()  # set model to evaluation mode
 
+    # 5️⃣ Perform inference on test data
     y_true, y_pred = [], []
-    for x,y in loader:
+    for x, y in loader:
         x = x.to(device)
         out = model(x)
-        y_true.extend(y.numpy().tolist())
-        y_pred.extend(out.argmax(1).cpu().numpy().tolist())
+        y_true.extend(y.numpy().tolist())                   # true labels
+        y_pred.extend(out.argmax(1).cpu().numpy().tolist()) # predicted class indices
 
-    print(classification_report(y_true, y_pred, target_names=[idx_to_class[i] for i in range(num_classes)], digits=4))
+    # 6️⃣ Print classification report (Precision, Recall, F1-score per class)
+    print(classification_report(
+        y_true,
+        y_pred,
+        target_names=[idx_to_class[i] for i in range(num_classes)],
+        digits=4
+    ))
 
-    # Confusion matrix plot
+    # 7️⃣ Compute and plot confusion matrix
     cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
     fig = plt.figure(figsize=(8,8))
-    plt.imshow(cm, interpolation='nearest')
+    plt.imshow(cm, interpolation='nearest')  # show color intensity for prediction counts
     plt.title('Confusion Matrix')
     plt.colorbar()
     tick_marks = np.arange(num_classes)
@@ -46,17 +60,20 @@ def main(args):
     plt.ylabel('True label')
     plt.xlabel('Predicted label')
 
+    # 8️⃣ Save the plot to a file
     os.makedirs(args.out_dir, exist_ok=True)
     out_path = os.path.join(args.out_dir, "confusion_matrix.png")
     plt.savefig(out_path, bbox_inches='tight', dpi=150)
     print("Saved:", out_path)
 
+
+# 9️⃣ Command-line argument setup
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--test_csv", type=str, required=True)
-    ap.add_argument("--ckpt", type=str, required=True)
-    ap.add_argument("--class_map", type=str, required=True)
-    ap.add_argument("--out_dir", type=str, default="report/figs")
+    ap.add_argument("--test_csv", type=str, required=True)      # path to test dataset csv
+    ap.add_argument("--ckpt", type=str, required=True)          # trained model checkpoint
+    ap.add_argument("--class_map", type=str, required=True)     # JSON with class index mapping
+    ap.add_argument("--out_dir", type=str, default="report/figs") # output folder
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--img_size", type=int, default=224)
     ap.add_argument("--num_workers", type=int, default=2)

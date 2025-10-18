@@ -16,15 +16,15 @@ from transforms import build_transforms
 from model_densenet121 import build_densenet121
 from utils import seed_everything, get_device, save_json
 
-
 # ----------------------------
-# Data loaders (with sampler)
+# Dataloaders with class-imbalance aware sampling
 # ----------------------------
 def build_loaders(train_csv, val_csv, batch_size, img_size, num_workers=2):
+    # Albumentations transforms: strong aug for train, deterministic for val
     train_ds = RetinaDataset(train_csv, tfm=build_transforms(img_size, is_train=True))
     val_ds   = RetinaDataset(val_csv,   tfm=build_transforms(img_size, is_train=False))
 
-    # inverse-frequency sampling (helps imbalance)
+    # WeightedRandomSampler: upsample rare classes by inverse frequency
     class_counts = (
         train_ds.df["label"].value_counts()
         .reindex(train_ds.classes)
@@ -39,12 +39,11 @@ def build_loaders(train_csv, val_csv, batch_size, img_size, num_workers=2):
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,  num_workers=num_workers)
     return train_loader, val_loader, train_ds.classes
 
-
 # ----------------------------
-# Utils: logging
+# CSV logger (history.csv)
 # ----------------------------
 def _append_history_row(out_dir, row_dict):
-    """Append training metrics to {out_dir}/history.csv (create with header if missing)."""
+    """Append per-epoch metrics (incl. LR) into runs/.../history.csv"""
     path = os.path.join(out_dir, "history.csv")
     is_new = not os.path.exists(path)
     with open(path, "a", newline="") as f:
@@ -53,26 +52,24 @@ def _append_history_row(out_dir, row_dict):
             writer.writeheader()
         writer.writerow(row_dict)
 
-
 # ----------------------------
-# Class weighting (Effective Number of Samples)
+# Class weights via Effective Number of Samples (more stable than 1/freq)
 # ----------------------------
 def effective_num_weights(labels, beta=0.9999, num_classes=None):
-    # labels: pandas Series of ints
     counts = labels.value_counts().sort_index()
     if num_classes is not None:
         counts = counts.reindex(range(num_classes)).fillna(0)
     counts = counts.to_numpy().astype(float)
     eff_num = 1.0 - np.power(beta, counts)
     weights = (1.0 - beta) / np.maximum(eff_num, 1e-8)
-    weights = weights / weights.mean()
+    weights = weights / weights.mean()  # normalize for scale stability
     return weights
 
-
 # ----------------------------
-# MixUp + EMA helpers
+# MixUp + EMA (stability + generalization)
 # ----------------------------
 def mixup_batch(x, y, alpha=0.2):
+    """Classic MixUp on a batch: convex-combine pairs of images and labels"""
     if alpha <= 0:
         return x, y, None
     lam = np.random.beta(alpha, alpha)
@@ -81,6 +78,7 @@ def mixup_batch(x, y, alpha=0.2):
     return x_mix, (y, y[idx]), lam
 
 class EMA:
+    """Exponential Moving Average of weights to smooth validation performance."""
     def __init__(self, model, decay=0.999):
         self.decay = decay
         self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -91,9 +89,8 @@ class EMA:
     def load_shadow(self, model):
         model.load_state_dict(self.shadow, strict=True)
 
-
 # ----------------------------
-# Train / Eval
+# Train / Eval loops
 # ----------------------------
 def train_epoch(model, loader, criterion, optimizer, device, grad_clip=None, mixup_alpha=0.0, ema=None):
     model.train()
@@ -104,23 +101,27 @@ def train_epoch(model, loader, criterion, optimizer, device, grad_clip=None, mix
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad(set_to_none=True)
 
+        # Optionally apply MixUp (loss is a convex mix of two CE/Focal losses)
         if mixup_alpha > 0:
             x, (y_a, y_b), lam = mixup_batch(x, y, alpha=mixup_alpha)
             out = model(x)
             loss = lam * criterion(out, y_a) + (1 - lam) * criterion(out, y_b)
             preds = out.argmax(1)
             all_preds.extend(preds.detach().cpu().tolist())
-            all_gts.extend(y.detach().cpu().tolist())  # metrics w.r.t. original hard labels
+            all_gts.extend(y.detach().cpu().tolist())  # metrics vs original labels
         else:
             out = model(x)
             loss = criterion(out, y)
             all_preds.extend(out.argmax(1).detach().cpu().tolist())
             all_gts.extend(y.detach().cpu().tolist())
 
+        # Backprop
         loss.backward()
         if grad_clip is not None and grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+
+        # Update EMA shadow weights after each step
         if ema is not None:
             ema.update(model)
 
@@ -129,7 +130,6 @@ def train_epoch(model, loader, criterion, optimizer, device, grad_clip=None, mix
     acc = accuracy_score(all_gts, all_preds)
     f1  = f1_score(all_gts, all_preds, average="macro")
     return running_loss / len(loader.dataset), acc, f1
-
 
 @torch.no_grad()
 def eval_epoch(model, loader, criterion, device):
@@ -148,14 +148,12 @@ def eval_epoch(model, loader, criterion, device):
     acc = accuracy_score(all_gts, all_preds)
     f1  = f1_score(all_gts, all_preds, average="macro")
 
-    # Detailed report + sanity check for collapse
+    # Human-readable sanity printouts
     print(classification_report(all_gts, all_preds, digits=4, zero_division=0))
     unique, cnt = np.unique(all_preds, return_counts=True)
     print("Val prediction distribution:", dict(zip(unique.tolist(), cnt.tolist())))
 
-    # also return preds/gts so caller can persist best cm/report
     return running_loss / len(loader.dataset), acc, f1, all_preds, all_gts
-
 
 # ----------------------------
 # Main
@@ -165,35 +163,34 @@ def main(args):
     device = get_device()
     print("Device:", device)
 
+    # Data + classes
     train_loader, val_loader, classes = build_loaders(
         args.train_csv, args.val_csv, args.batch_size, args.img_size, args.num_workers
     )
     num_classes = len(classes)
 
+    # Model
     model = build_densenet121(num_classes, pretrained=args.pretrained).to(device)
 
-    # --- param groups: freeze backbone for few epochs (when pretrained) ---
+    # Freeze backbone for warm-up if pretrained
     backbone_params = list(model.features.parameters())
     head_params     = list(model.classifier.parameters())
-
     if args.pretrained:
         for p in backbone_params:
             p.requires_grad = False
         print(f">> Frozen backbone, training head for {args.freeze_epochs} epoch(s)")
-    else:
-        for p in backbone_params:
-            p.requires_grad = True
 
     os.makedirs(args.out_dir, exist_ok=True)
     class_to_idx = {str(c): int(i) for i, c in enumerate(classes)}
     save_json(class_to_idx, os.path.join(args.out_dir, "class_to_idx.json"))
 
-    # ------- class weights (Effective Number of Samples) -------
+    # Class weights via Effective Number
     train_df = pd.read_csv(args.train_csv)
     eff_w = effective_num_weights(train_df["label"], beta=0.9999, num_classes=num_classes)
     class_weights = torch.tensor(eff_w, dtype=torch.float32, device=device)
     print("Loss class weights (effective-num):", class_weights.detach().cpu().numpy())
 
+    # Loss: Focal (recommended) or CE; both support label smoothing and weights
     if args.focal:
         criterion = FocalLoss(
             gamma=2.0,
@@ -210,25 +207,25 @@ def main(args):
             )
         criterion = ce_loss
 
-    # Optimizer: larger LR for head, smaller for backbone (while frozen)
+    # Optimizer: two LR groups during warm-up (head higher, backbone lower)
     optimizer = AdamW([
         {"params": head_params, "lr": args.head_lr},
         {"params": backbone_params, "lr": args.backbone_lr}
     ], weight_decay=args.weight_decay)
 
-    # Cosine warm restarts works well with unfreeze
+    # CosineAnnealingWarmRestarts: smooth cyclical LR; pairs well with unfreezing
     scheduler = CosineAnnealingWarmRestarts(
         optimizer,
         T_0=max(args.freeze_epochs + 2, 4),
         T_mult=2
     )
 
-    # optional EMA
+    # Optional Exponential Moving Average of weights
     ema = EMA(model, decay=0.999) if args.ema else None
 
     best_f1, no_improve = -1.0, 0
     for epoch in range(1, args.epochs+1):
-        # unfreeze backbone after warmup
+        # Unfreeze backbone after warm-up; then use single LR for all params
         if args.pretrained and epoch == args.freeze_epochs + 1:
             for p in backbone_params:
                 p.requires_grad = True
@@ -242,8 +239,11 @@ def main(args):
             grad_clip=args.grad_clip, mixup_alpha=args.mixup_alpha, ema=ema
         )
         va_loss, va_acc, va_f1, va_preds, va_gts = eval_epoch(model, val_loader, criterion, device)
-        scheduler.step(epoch - 1 + 1e-8)  # align phase for WarmRestarts
 
+        # step with epoch fraction to align restart phase
+        scheduler.step(epoch - 1 + 1e-8)
+
+        # Log current LR (from the first param group)
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"  LR={current_lr:.6e}")
         _append_history_row(args.out_dir, {
@@ -257,23 +257,23 @@ def main(args):
             "val_f1": f"{va_f1:.6f}",
         })
 
+        # Save best by validation macro-F1; if EMA used, save shadow weights
         if va_f1 > best_f1:
             best_f1 = va_f1
             no_improve = 0
             ckpt = os.path.join(args.out_dir, "best.pt")
 
             if ema is not None:
-                # Save EMA weights
                 bak = deepcopy(model.state_dict())
-                ema.load_shadow(model)
+                ema.load_shadow(model)        # swap in EMA weights
                 torch.save(model.state_dict(), ckpt)
-                model.load_state_dict(bak)
+                model.load_state_dict(bak)    # restore live weights
             else:
                 torch.save(model.state_dict(), ckpt)
 
             print("  saved:", ckpt)
 
-            # also persist best report + confusion matrix
+            # Persist best report + confusion matrix arrays for later plotting
             report_txt = classification_report(va_gts, va_preds, digits=4, zero_division=0)
             with open(os.path.join(args.out_dir, "report_best.txt"), "w") as f:
                 f.write(report_txt)
@@ -287,7 +287,6 @@ def main(args):
 
     print(f"Best val macro-F1: {best_f1:.4f}")
 
-
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--train_csv", type=str, required=True)
@@ -298,9 +297,9 @@ if __name__ == "__main__":
     ap.add_argument("--img_size", type=int, default=224)
 
     # LRs
-    ap.add_argument("--lr", type=float, default=3e-4)              # after unfreeze
-    ap.add_argument("--head_lr", type=float, default=1e-3)         # warmup for head
-    ap.add_argument("--backbone_lr", type=float, default=1e-4)     # warmup tiny LR
+    ap.add_argument("--lr", type=float, default=3e-4)              # after unfreeze (single LR for all)
+    ap.add_argument("--head_lr", type=float, default=1e-3)         # warmup head LR
+    ap.add_argument("--backbone_lr", type=float, default=1e-4)     # warmup backbone LR
     ap.add_argument("--weight_decay", type=float, default=1e-4)
 
     ap.add_argument("--num_workers", type=int, default=2)
